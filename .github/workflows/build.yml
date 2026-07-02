@@ -20,7 +20,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Import smoke
-        run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, app; print('imports ok')"
+        run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, captcha_dialog, app; print('imports ok')"
 
       - name: Build exe
         run: >

@@ -12,7 +12,8 @@ import tkinter as tk
 from tkinter import scrolledtext, messagebox
 
 import config
-from bridge import remote_log, OwnerCaptchaBridge
+from bridge import remote_log
+from captcha_dialog import TkCaptchaHandler
 
 
 class App:
@@ -42,7 +43,7 @@ class App:
         note = tk.Label(
             root,
             text="첫 실행 시 전용 크롬을 자동 설치합니다(1~2분). 크롬 미설치 PC도 동작합니다.\n"
-                 "보안문자가 나오면 자동으로 담당자에게 전달되어 대신 처리됩니다.",
+                 "네이버 보안문자가 나오면 작은 입력창이 뜹니다. 사진을 보고 답을 입력해 주세요.",
             fg="#888", justify="left", anchor="w",
         )
         note.pack(fill="x", padx=10)
@@ -114,8 +115,8 @@ class App:
             self.driver = build_driver(headless=False, log=self.log)
 
             self.set_status("네이버 로그인 중...")
-            bridge = OwnerCaptchaBridge(log=self.log, status=self.set_status)
-            login = NaverLogin(self.driver, log=self.log, captcha_callback=bridge,
+            captcha = TkCaptchaHandler(self.root, log=self.log, should_stop=self._stop.is_set)
+            login = NaverLogin(self.driver, log=self.log, captcha_callback=captcha,
                                should_stop=self._stop.is_set)
             ok = login.login(nid, npw)
             if not ok:
