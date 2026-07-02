@@ -1,0 +1,56 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Import smoke
+        run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, app; print('imports ok')"
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --noconsole
+          --name "이지론배너자동등록"
+          --collect-all selenium
+          main.py
+
+      - name: GUI construct self-test (build + close window, no network)
+        shell: cmd
+        run: |
+          set DIAG_AUTO=1
+          dist\이지론배너자동등록.exe
+
+      - name: Verify exe file type
+        shell: bash
+        run: file dist/*.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ezloan-exe
+          path: dist/*.exe
+
+      - name: Publish release (ASCII asset name for reliable download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path config.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Copy-Item "dist\이지론배너자동등록.exe" "dist\ezloan-bot-$ver.exe"
+          gh release create latest "dist\ezloan-bot-$ver.exe" --title latest --notes "auto build v$ver"
+          if ($LASTEXITCODE -ne 0) { gh release upload latest "dist\ezloan-bot-$ver.exe" --clobber }
