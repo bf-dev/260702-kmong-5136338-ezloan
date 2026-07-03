@@ -125,8 +125,32 @@ class App:
                 return
 
             self.set_status("로그인 완료! 배너 자동등록을 시작합니다.")
+            # 등록 API 는 이지론(ezloan.io) 세션 쿠키로 인증한다.
+            # 네이버 도메인 쿠키만 있고 ezloan_sess 가 없으면 이후 등록이 전부 실패하므로,
+            # 로그인 직후 반드시 이지론 도메인으로 이동한 뒤 그 도메인의 쿠키를 수집한다.
+            try:
+                self.driver.get(config.RQ_URL)
+                import time as _t
+                _t.sleep(1.0)
+            except Exception:
+                pass
             cookies = self.driver.get_cookies()
-            remote_log("login_success", f"쿠키 {len(cookies)}개", force=True)
+            ez = [c for c in cookies if "ezloan" in (c.get("domain") or "")]
+            names = sorted({c.get("name", "") for c in ez})
+            has_sess = any("ezloan_sess" in n or "ci_session" in n for n in names)
+            remote_log(
+                "login_success",
+                f"전체쿠키 {len(cookies)}개, ezloan도메인 {len(ez)}개, "
+                f"ezloan_sess={'있음' if has_sess else '없음'}, 쿠키명={names[:20]}",
+                force=True,
+            )
+            if not has_sess:
+                remote_log(
+                    "login_no_ezloan_session",
+                    "네이버 로그인은 됐으나 ezloan.io 세션 쿠키가 없음. "
+                    "등록 API 인증이 전부 실패할 것으로 예상됨.",
+                    force=True,
+                )
             # 로그인 후에는 브라우저가 필요 없으므로 닫아 리소스를 아낀다.
             self._quit_driver()
 

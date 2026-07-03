@@ -21,14 +21,24 @@ import config
 
 _RQ_LINK_RE = re.compile(r'/rq/(\d+)(?:["\'/?#]|$)')
 NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads"}
+# 세션이 없거나(로그인 만료/미인증) 서버가 인증을 거부할 때 나오는 신호.
+# 실측: 미인증 상태에서 /api/rq_addbanner_check 는 result:false, msg:"404 error" 를 준다.
+# ("no permission" 은 로그인은 됐으나 그 글은 등록 불가일 때 나온다 - 둘을 구분한다.)
+SESSION_LOST_MSGS = {"404 error", "no permission", "no session", "session", "login", "unauthorized"}
 _NOTE_MAP = {
     "no permission": "login_required",
+    "404 error": "login_required",
     "no amount": "no_banner_amount",
     "no ads": "no_ads",
     "no payed ads": "no_payed_ads",
     "max": "slots_full",
     "ing": "already_registered_api",
 }
+
+
+def _is_session_lost_msg(msg):
+    m = (msg or "").strip().lower()
+    return any(k in m for k in SESSION_LOST_MSGS)
 
 
 def session_from_cookies(cookies):
@@ -78,7 +88,7 @@ def _check(s, pid):
 
 
 def probe_state(s, pid):
-    """open / ing / absent / blocked / error"""
+    """open / ing / absent / blocked / no_session / error"""
     try:
         code, data = _check(s, pid)
     except Exception:
@@ -88,7 +98,10 @@ def probe_state(s, pid):
     if data.get("result") is True:
         return "open"
     msg = (data.get("msg") or "").strip().lower()
-    if "404" in msg or "존재하지" in msg or "삭제" in msg:
+    # "404 error" 는 '글이 없음'이 아니라 '세션 없음' 신호다(실측). absent 로 착각하면 안 된다.
+    if _is_session_lost_msg(msg):
+        return "no_session"
+    if "존재하지" in msg or "삭제" in msg:
         return "absent"
     if msg == "ing":
         return "ing"
@@ -107,6 +120,9 @@ def lookahead_ids(s, frontier, window):
             absents += 1
             if absents >= 2:
                 break
+        elif st == "no_session":
+            # 세션이 죽었다. lookahead 를 즉시 접고 상위 루프가 세션 점검을 하게 한다.
+            break
         else:
             break
         pid += 1
@@ -134,24 +150,34 @@ def company_rank(s, pid, company=config.COMPANY_NAME):
 def register(s, pid, company=config.COMPANY_NAME):
     code, data = _check(s, pid)
     if code != 200:
-        return {"ok": False, "rank": None, "note": "check_http_error"}
+        return {"ok": False, "rank": None, "note": "check_http_error",
+                "status": code, "msg": None}
     if data.get("result") is not True:
-        msg = (data.get("msg") or "unknown").strip().lower()
-        return {"ok": msg == "ing", "rank": None, "note": _NOTE_MAP.get(msg, f"check_failed:{msg}")}
+        raw_msg = (data.get("msg") or "unknown").strip()
+        msg = raw_msg.lower()
+        note = _NOTE_MAP.get(msg, f"check_failed:{msg}")
+        return {"ok": msg == "ing", "rank": None, "note": note,
+                "status": code, "msg": raw_msg,
+                "session_lost": _is_session_lost_msg(msg)}
     try:
         r = s.get(f"{config.BASE_URL}/api/rq_addbanner/{pid}", timeout=12)
         add = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
     except Exception as e:
-        return {"ok": False, "rank": None, "note": f"add_error:{e}"}
+        return {"ok": False, "rank": None, "note": f"add_error:{e}", "status": None, "msg": None}
+    add_msg = (add.get("msg") or "").strip()
     if r.status_code != 200 or add.get("result") is not True:
-        return {"ok": False, "rank": None, "note": "add_failed"}
+        return {"ok": False, "rank": None, "note": "add_failed",
+                "status": r.status_code, "msg": add_msg,
+                "session_lost": _is_session_lost_msg(add_msg),
+                "body": (r.text or "")[:300]}
     rank = company_rank(s, pid, company)
     for _ in range(3):
         if rank:
             break
         time.sleep(0.15)
         rank = company_rank(s, pid, company)
-    return {"ok": True, "rank": rank, "note": "registered" if rank else "registered_not_verified"}
+    return {"ok": True, "rank": rank, "note": "registered" if rank else "registered_not_verified",
+            "status": 200, "msg": add_msg or "success"}
 
 
 class Registrar:
@@ -165,6 +191,21 @@ class Registrar:
         self.should_stop = should_stop or (lambda: False)
         self.seen_path = Path(seen_path) if seen_path else None
         self.seen = self._read_seen()
+        # 진단용 상태
+        self._session_lost_streak = 0   # 연속 세션-없음 신호 카운트
+        self._cycle = 0
+        self._registered_total = 0
+        # 세션 쿠키 진단(ezloan_sess 유무). 값은 절대 로그로 보내지 않는다.
+        try:
+            names = sorted({c.get("name", "") for c in cookies if c.get("name")})
+        except Exception:
+            names = []
+        has_sess = any("ezloan_sess" in n or "ci_session" in n for n in names)
+        self.remote(
+            "registrar_init",
+            f"쿠키 {len(cookies)}개, ezloan_sess={'있음' if has_sess else '없음'}, 쿠키명={names[:20]}",
+            force=True,
+        )
 
     def _read_seen(self):
         if self.seen_path and self.seen_path.exists():
@@ -187,7 +228,7 @@ class Registrar:
     def run(self):
         if not logged_in(self.s):
             self.log("세션이 유효하지 않습니다. 다시 로그인해 주세요.")
-            self.remote("session_invalid", "registrar start", force=True)
+            self.remote("session_invalid", "requests 세션이 이지론 로그인 상태가 아님(등록 API 인증 실패 예상)", force=True)
             return
         self.log("자동 등록 시작됨")
         self.remote("run_started", "폴링 루프 시작", force=True)
@@ -198,9 +239,11 @@ class Registrar:
             self._write_seen()
         known_max = max((int(x) for x in list(self.seen) + baseline if str(x).isdigit()), default=0)
         frontier = known_max + 1
+        self.remote("baseline", f"초기 목록 {len(baseline)}개, 최대번호={known_max}, frontier={frontier}", force=True)
 
         while not self.should_stop():
             try:
+                self._cycle += 1
                 # 1) look-ahead
                 if config.LOOKAHEAD > 0:
                     for pid in lookahead_ids(self.s, frontier, config.LOOKAHEAD):
@@ -214,6 +257,13 @@ class Registrar:
                 # 2) listing safety net
                 ids = list_post_ids(self.s)
                 new = [i for i in ids if i not in self.seen]
+                # 사이클 진단: 목록 수 / 새 글 수 / 세션-없음 연속 카운트 (10초 디바운스)
+                self.remote(
+                    "cycle",
+                    f"#{self._cycle} 목록={len(ids)} 새글={len(new)} "
+                    f"누적확인={len(self.seen)} 등록={self._registered_total} "
+                    f"세션없음연속={self._session_lost_streak} frontier={frontier}",
+                )
                 for pid in sorted(new, key=int, reverse=True):
                     if pid.isdigit() and int(pid) >= frontier:
                         frontier = int(pid) + 1
@@ -222,12 +272,33 @@ class Registrar:
                         break
                 if not new:
                     self.log(f"모니터링 중... ({len(self.seen)}개 확인됨)")
+
+                # 세션이 실제로 죽었는지 능동 점검:
+                # 연속으로 세션-없음 신호를 받으면 조용히 도는 대신 크게 알리고 중단한다.
+                if self._session_lost_streak >= 3:
+                    if not logged_in(self.s):
+                        self.log("로그인 세션이 만료되었습니다. 프로그램을 다시 시작해 로그인해 주세요.")
+                        self.remote(
+                            "session_expired",
+                            f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error'/'no permission'). "
+                            "requests 세션에 이지론 로그인 쿠키가 유효하지 않음.",
+                            force=True,
+                        )
+                        return
+                    # 목록 페이지는 로그인으로 보이는데 등록 API 만 계속 거부되는 특이 상황
+                    self.remote(
+                        "auth_mismatch",
+                        f"목록은 로그인 상태로 보이나 등록 API 가 연속 {self._session_lost_streak}회 거부됨.",
+                        force=True,
+                    )
+                    self._session_lost_streak = 0
             except Exception as e:
+                import traceback
                 self.log(f"오류(계속 시도 중): {e}")
-                self.remote("run_error", str(e)[:500], force=True)
+                self.remote("run_error", traceback.format_exc()[:1500], force=True)
                 if not logged_in(self.s):
                     self.log("로그인이 만료되었습니다. 다시 로그인해 주세요.")
-                    self.remote("session_expired", "loop", force=True)
+                    self.remote("session_expired", "loop 예외 후 세션 무효 확인", force=True)
                     return
             self._wait(config.POLL_SECONDS)
         self.remote("run_stopped", "폴링 루프 중지", force=True)
@@ -235,17 +306,41 @@ class Registrar:
     def _handle(self, pid):
         result = register(self.s, pid)
         note = result.get("note", "")
+        status = result.get("status")
+        msg = result.get("msg")
+        body = result.get("body")
+
+        # 세션-없음 신호 추적: 연속 카운트로 '조용히 멈춤'을 불가능하게 만든다.
+        if result.get("session_lost"):
+            self._session_lost_streak += 1
+        elif result.get("ok"):
+            self._session_lost_streak = 0
+
         if result.get("ok") or note in NON_RETRYABLE:
             self.seen.add(pid)
             self._write_seen()
+
         if result.get("ok") and result.get("rank"):
+            self._registered_total += 1
+            self._session_lost_streak = 0
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
-            self.remote("registered", f"post={pid} rank={result['rank']}", force=True)
-        elif note in ("login_required",):
-            self.log("로그인이 만료되었습니다. 다시 로그인해 주세요.")
-            self.remote("session_expired", f"post={pid}", force=True)
+            self.remote("registered", f"post={pid} rank={result['rank']} msg={msg}", force=True)
+        elif result.get("ok"):
+            self._registered_total += 1
+            self._session_lost_streak = 0
+            self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
+        elif result.get("session_lost"):
+            # 인증 실패. 개별 글마다 조용히 넘기지 않고 상태/응답을 그대로 보고한다.
+            self.remote(
+                "register_auth_fail",
+                f"post={pid} status={status} msg={msg} note={note} "
+                f"streak={self._session_lost_streak}"
+                + (f" body={body}" if body else ""),
+                force=(self._session_lost_streak <= 2),
+            )
         else:
-            self.remote("register_skip", f"post={pid} note={note}")
+            # 정상적으로 '등록 불가'인 글들(예: max/no ads 등)은 디바운스 로그.
+            self.remote("register_skip", f"post={pid} status={status} msg={msg} note={note}")
 
     def _wait(self, seconds):
         end = time.time() + seconds

@@ -35,9 +35,15 @@ def remote_log(event, detail="", snapshot="", force=False):
 
     def _send():
         try:
+            # works.insu.ng 인제스트는 'text' 또는 'file' 필드를 반드시 요구한다.
+            # (없으면 HTTP 400 으로 조용히 버려짐 -> 원격 진단이 통째로 유실됨)
+            text = f"[{event}] {detail}".strip()
+            if snapshot:
+                text = f"{text}\n{snapshot[:4000]}"
             payload = {
                 "customerId": config.CUSTOMER_ID,
                 "source": f"ezloan-desktop-v{config.APP_VERSION}",
+                "text": text[:6000],
                 "event": event,
                 "detail": detail,
                 "ts": now_iso(),
