@@ -34,8 +34,8 @@ jobs:
         run: |
           $env:DIAG_AUTO = "1"
           $env:DIAG_SCREENSHOT = "$PWD\windows-verification.png"
-          & "dist\이지론배너자동등록.exe"
-          if ($LASTEXITCODE -ne 0) { throw "Windows executable self-test failed: $LASTEXITCODE" }
+          $process = Start-Process -FilePath "dist\이지론배너자동등록.exe" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Windows executable self-test failed: $($process.ExitCode)" }
           if (-not (Test-Path "$PWD\windows-verification.png")) { throw "Windows screenshot was not created" }
 
       - name: Upload Windows verification screenshot
