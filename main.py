@@ -2,6 +2,7 @@
 """진입점. 빌드/실행 공통."""
 
 import os
+import threading
 import tkinter as tk
 
 from app import App
@@ -14,6 +15,10 @@ def main():
 
     # CI 빌드 검증용: 창을 만들고 바로 닫아 정상 종료를 확인(네트워크/로그인 없음).
     if os.getenv("DIAG_AUTO") == "1":
+        # 일반 실행 경로에서 사용하는 스레드 시작도 패키지된 EXE에서 검증한다.
+        probe = threading.Thread(target=lambda: None)
+        probe.start()
+        probe.join(timeout=2)
         root.after(500, root.destroy)
         root.mainloop()
         print("selftest ok")
