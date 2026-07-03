@@ -41,18 +41,38 @@ def _is_session_lost_msg(msg):
     return any(k in m for k in SESSION_LOST_MSGS)
 
 
+def _safe_msg(r):
+    try:
+        return (r.json().get("msg") or "").strip()
+    except Exception:
+        return ""
+
+
 def session_from_cookies(cookies):
     s = requests.Session()
+    csrf = None
     for c in cookies:
         try:
             s.cookies.set(c["name"], c["value"], domain=(c.get("domain") or "ezloan.io").lstrip("."))
+            if c["name"] == "csrf_cookie_ezloan":
+                csrf = c["value"]
         except Exception:
             continue
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
         "X-Requested-With": "XMLHttpRequest",
+        # 실측(2026-07-03): 이지론 API(/api/rq_addbanner_check, rq_addbanner)는
+        # 동일 출처 Referer 가 없으면 유효한 세션 쿠키가 있어도 msg:"404 error" 로 거부한다.
+        # (Referer 없음/외부 Referer -> "404 error", 동일 출처 Referer -> 정상 판정)
+        # 브라우저는 항상 Referer 를 보내므로 페이지는 로그인 상태로 보이지만,
+        # 앱의 순수 requests 세션은 Referer 가 없어 API 마다 거부돼 무한 인증실패 루프가 났다.
+        "Referer": config.RQ_URL,
+        "Origin": config.BASE_URL,
     })
+    # CodeIgniter double-submit 방어 대비: csrf 쿠키 값을 헤더로도 되돌려 준다(무해).
+    if csrf:
+        s.headers["X-CSRF-TOKEN"] = csrf
     return s
 
 
@@ -186,6 +206,8 @@ class Registrar:
     def __init__(self, cookies, log=print, remote=None, should_stop=None,
                  seen_path=None):
         self.s = session_from_cookies(cookies)
+        self._cookies_raw = cookies or []
+        self._diag_sent = False   # auth_diag_dump 는 실행당 1회만
         self.log = log
         self.remote = remote or (lambda *a, **k: None)
         self.should_stop = should_stop or (lambda: False)
@@ -207,6 +229,66 @@ class Registrar:
             f"쿠키 {len(cookies)}개, ezloan_sess={'있음' if has_sess else '없음'}, 쿠키명={names[:20]}",
             force=True,
         )
+
+    def _send_auth_diag(self, pid):
+        """등록 인증이 거부될 때(실행당 1회) 실제 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
+
+        사장님 요청: 추측 대신 실측 데이터로 원인 파악. 쿠키 값 전체와 실제로 나간 요청 헤더,
+        응답 본문 전체를 그대로 보낸다(고객 세션 진단용, customerId 로 추적).
+        """
+        if self._diag_sent:
+            return
+        self._diag_sent = True
+        try:
+            # 1) 캡처된 쿠키 전체(이름/값/속성)
+            cookie_dump = []
+            for c in self._cookies_raw:
+                cookie_dump.append({
+                    "name": c.get("name"),
+                    "value": c.get("value"),
+                    "domain": c.get("domain"),
+                    "path": c.get("path"),
+                    "secure": c.get("secure"),
+                    "httpOnly": c.get("httpOnly"),
+                    "expiry": c.get("expiry") or c.get("expires"),
+                })
+            csrf_val = next((c.get("value") for c in self._cookies_raw
+                             if c.get("name") == "csrf_cookie_ezloan"), None)
+
+            # 2) 실패하는 register(check) 요청을 한 번 실제로 날려 요청/응답을 그대로 캡처
+            url = f"{config.BASE_URL}/api/rq_addbanner_check/{pid}"
+            r = self.s.get(url, timeout=12)
+            req = r.request
+            out_req = {
+                "url": req.url,
+                "method": req.method,
+                "headers": dict(req.headers),
+                "cookie_header": req.headers.get("Cookie"),
+                "cookie_attached": bool(req.headers.get("Cookie")),
+            }
+            resp = {
+                "status": r.status_code,
+                "headers": dict(r.headers),
+                "body": r.text,   # 전체 본문(작으므로 자르지 않음)
+            }
+
+            payload = {
+                "csrf_cookie_ezloan": csrf_val,
+                "cookies": cookie_dump,
+                "session_headers_default": dict(self.s.headers),
+                "request": out_req,
+                "response": resp,
+                "note": "same-origin Referer 없으면 msg='404 error'; Referer 있으면 인증 평가됨",
+            }
+            self.remote(
+                "auth_diag_dump",
+                f"post={pid} status={resp['status']} msg={_safe_msg(r)} "
+                f"csrf_present={bool(csrf_val)} referer={self.s.headers.get('Referer')}",
+                snapshot=json.dumps(payload, ensure_ascii=False),
+                force=True,
+            )
+        except Exception as e:
+            self.remote("auth_diag_dump", f"진단 덤프 실패: {e}", force=True)
 
     def _read_seen(self):
         if self.seen_path and self.seen_path.exists():
@@ -356,6 +438,8 @@ class Registrar:
             self._session_lost_streak = 0
             self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
         elif result.get("session_lost"):
+            # 인증 실패. 실행당 1회, 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
+            self._send_auth_diag(pid)
             # 인증 실패. 개별 글마다 조용히 넘기지 않고 상태/응답을 그대로 보고한다.
             self.remote(
                 "register_auth_fail",
