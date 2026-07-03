@@ -29,11 +29,20 @@ jobs:
           --collect-all selenium
           main.py
 
-      - name: GUI construct self-test (build + close window, no network)
-        shell: cmd
+      - name: GUI construct self-test and Windows screenshot (no network)
+        shell: pwsh
         run: |
-          set DIAG_AUTO=1
-          dist\이지론배너자동등록.exe
+          $env:DIAG_AUTO = "1"
+          $env:DIAG_SCREENSHOT = "$PWD\windows-verification.png"
+          & "dist\이지론배너자동등록.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Windows executable self-test failed: $LASTEXITCODE" }
+          if (-not (Test-Path "$PWD\windows-verification.png")) { throw "Windows screenshot was not created" }
+
+      - name: Upload Windows verification screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-verification
+          path: windows-verification.png
 
       - name: Verify exe file type
         shell: bash

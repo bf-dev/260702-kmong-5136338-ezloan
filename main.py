@@ -19,7 +19,26 @@ def main():
         probe = threading.Thread(target=lambda: None)
         probe.start()
         probe.join(timeout=2)
-        root.after(500, root.destroy)
+
+        screenshot_path = os.getenv("DIAG_SCREENSHOT")
+
+        def _finish_diagnostic():
+            try:
+                if screenshot_path:
+                    from PIL import ImageGrab
+
+                    root.lift()
+                    root.attributes("-topmost", True)
+                    root.update_idletasks()
+                    x = root.winfo_rootx()
+                    y = root.winfo_rooty()
+                    width = root.winfo_width()
+                    height = root.winfo_height()
+                    ImageGrab.grab(bbox=(x, y, x + width, y + height)).save(screenshot_path)
+            finally:
+                root.destroy()
+
+        root.after(1500 if screenshot_path else 500, _finish_diagnostic)
         root.mainloop()
         print("selftest ok")
         return
