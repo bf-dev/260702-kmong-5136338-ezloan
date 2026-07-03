@@ -68,14 +68,21 @@ class App:
 
         remote_log("app_started", f"버전 {config.APP_VERSION}", force=True)
 
-        # 자동 업데이트 감시 스레드 시작(백그라운드, 메인 루프를 절대 막지 않음).
-        # 새 버전이 준비되면 등록 루프를 깔끔히 멈추고(_stop.set) 현재 쿠키를 저장한 뒤 재시작한다.
-        self.updater = UpdaterThread(
-            stop_running_loop=self._stop.set,
-            snapshot_session=self._snapshot_cookies,
-            status_cb=self.set_status,
-        )
-        self.updater.start()
+        # 자동 업데이트는 운영자 지시(2026-07-03)로 비활성화됨.
+        # config.AUTO_UPDATE_ENABLED 가 True 일 때만 감시 스레드를 띄운다.
+        # 꺼져 있으면 version 폴링/자기 exe 교체를 하지 않고 등록 루프만 돈다.
+        self.updater = None
+        if getattr(config, "AUTO_UPDATE_ENABLED", False):
+            self.updater = UpdaterThread(
+                stop_running_loop=self._stop.set,
+                snapshot_session=self._snapshot_cookies,
+                status_cb=self.set_status,
+            )
+            self.updater.start()
+        else:
+            remote_log("auto_update_disabled",
+                       f"자동 업데이트 비활성(운영자 지시) 버전 {config.APP_VERSION}",
+                       force=True)
 
     def _snapshot_cookies(self):
         with self._cookies_lock:

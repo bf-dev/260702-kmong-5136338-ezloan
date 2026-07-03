@@ -30,6 +30,10 @@ STATIC_BASE = f"https://works.insu.ng/works/public/{CUSTOMER_ID}"
 # 별도 파일(version-ezloan-desktop.json)로 자기 버전을 관리한다.
 VERSION_URL = f"{STATIC_BASE}/version-ezloan-desktop.json"
 UPDATE_CHECK_SECONDS = 60
+# 자동 업데이트 스위치. 운영자 지시(2026-07-03)로 자기 자동 업데이트를 끈다.
+# False 이면 앱은 더 이상 version-ezloan-desktop.json 을 폴링하거나 자기 exe 를
+# 교체하지 않는다. 등록/스크래핑 등 나머지 동작은 그대로 유지된다.
+AUTO_UPDATE_ENABLED = False
 
 # 프로그램이 자체 관리하는 크롬(Chrome for Testing) / 프로필 위치
 _HOME = os.path.expanduser("~")
