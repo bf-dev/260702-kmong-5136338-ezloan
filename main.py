@@ -19,6 +19,15 @@ def main():
         print("selftest ok")
         return
 
+    # 시작 직후 저장된 로그인 세션 복구 시도(자동 업데이트 재시작/재실행 후 재로그인 방지).
+    # 백그라운드에서 검증하고, 유효하면 등록을 자동 재개한다.
+    def _auto_recover():
+        try:
+            app.try_recover_session()
+        except Exception:
+            pass
+    threading.Thread(target=_auto_recover, daemon=True).start()
+
     root.mainloop()
 
 

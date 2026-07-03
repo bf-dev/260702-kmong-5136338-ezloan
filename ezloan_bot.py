@@ -195,6 +195,7 @@ class Registrar:
         self._session_lost_streak = 0   # 연속 세션-없음 신호 카운트
         self._cycle = 0
         self._registered_total = 0
+        self._last_session_save = 0.0   # 갱신된 쿠키를 디스크에 다시 저장한 시각
         # 세션 쿠키 진단(ezloan_sess 유무). 값은 절대 로그로 보내지 않는다.
         try:
             names = sorted({c.get("name", "") for c in cookies if c.get("name")})
@@ -222,6 +223,28 @@ class Registrar:
             self.seen_path.parent.mkdir(parents=True, exist_ok=True)
             vals = list(self.seen)[-1000:]
             self.seen_path.write_text(json.dumps({"seen": vals}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _persist_session(self, force=False):
+        """이지론 서버가 갱신해 준 슬라이딩 쿠키(ezloan_sess Max-Age=7200)를 디스크에 다시 저장.
+
+        저장을 안 하면 재시작 후 복구 세션이 만료된 옛 쿠키라 죽는다(배너봇에서 겪은 교훈).
+        3분마다 한 번씩만 저장한다.
+        """
+        now = time.time()
+        if not force and (now - self._last_session_save) < 180:
+            return
+        self._last_session_save = now
+        try:
+            from session_store import save_session
+            cookies = [
+                {"name": c.name, "value": c.value,
+                 "domain": c.domain, "path": c.path or "/"}
+                for c in self.s.cookies
+            ]
+            if cookies:
+                save_session(cookies, log=self.log)
         except Exception:
             pass
 
@@ -272,6 +295,9 @@ class Registrar:
                         break
                 if not new:
                     self.log(f"모니터링 중... ({len(self.seen)}개 확인됨)")
+
+                # 갱신된 세션 쿠키를 주기적으로 디스크에 저장(재시작 복구가 살아있게 유지).
+                self._persist_session()
 
                 # 세션이 실제로 죽었는지 능동 점검:
                 # 연속으로 세션-없음 신호를 받으면 조용히 도는 대신 크게 알리고 중단한다.

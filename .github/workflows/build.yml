@@ -20,7 +20,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Import smoke
-        run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, captcha_dialog, app; print('imports ok')"
+        run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, captcha_dialog, session_store, updater, app; print('imports ok')"
 
       - name: Build exe
         run: >
@@ -45,12 +45,14 @@ jobs:
           name: ezloan-exe
           path: dist/*.exe
 
-      - name: Publish release (ASCII asset name for reliable download)
+      - name: Publish release (versioned ASCII asset name; never overwrite a served filename)
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $ver = (Select-String -Path config.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          Copy-Item "dist\이지론배너자동등록.exe" "dist\ezloan-bot-$ver.exe"
-          gh release create latest "dist\ezloan-bot-$ver.exe" --title latest --notes "auto build v$ver"
-          if ($LASTEXITCODE -ne 0) { gh release upload latest "dist\ezloan-bot-$ver.exe" --clobber }
+          # 자동 업데이트가 받는 파일명은 항상 버전 접미사(ezloan-desktop-<ver>.exe)로만 배포한다.
+          # (이미 서빙 중인 파일명을 덮어쓰면 Cloudflare 엣지 캐시가 옛 바이트를 내보내 재시작 루프 발생)
+          Copy-Item "dist\이지론배너자동등록.exe" "dist\ezloan-desktop-$ver.exe"
+          gh release upload latest "dist\ezloan-desktop-$ver.exe" --clobber
+          if ($LASTEXITCODE -ne 0) { gh release create latest "dist\ezloan-desktop-$ver.exe" --title latest --notes "auto build v$ver" }

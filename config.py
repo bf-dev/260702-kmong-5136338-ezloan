@@ -3,14 +3,15 @@
 
 import os
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 CUSTOMER_ID = "5136338"
 
 # 이지론
+# (아래 셀렉터/엔드포인트는 2026-07-03 실제 ezloan.io 라이브 사이트에서 검증됨)
 BASE_URL = "https://ezloan.io"
 COMPANY_NAME = "더원대부"           # 배너 등록 순위를 확인할 광고주 상호
-LOGIN_URL = f"{BASE_URL}/m/login"   # "네이버로 로그인" 버튼이 있는 페이지
-RQ_URL = f"{BASE_URL}/rq"           # 실시간 대출 문의 목록
+LOGIN_URL = f"{BASE_URL}/m/login"   # "네이버로 로그인" 버튼이 있는 페이지 (검증: 2026-07-03)
+RQ_URL = f"{BASE_URL}/rq"           # 실시간 대출 문의 목록 (검증: 2026-07-03)
 
 # 네이버 로그인 (한국어 강제)
 NAVER_LOGIN_URL = "https://nid.naver.com/nidlogin.login?locale=ko_KR"
@@ -23,10 +24,17 @@ MAX_POSTS = 20             # 목록에서 확인할 최대 글 수
 # 원격 진단 / 캡차 중계용 (works.insu.ng 게이트웨이)
 WORKS_API = "https://works.insu.ng/works/api"
 STATIC_BASE = f"https://works.insu.ng/works/public/{CUSTOMER_ID}"
-VERSION_URL = f"{STATIC_BASE}/version.json"
+# 자동 업데이트용 버전 파일.
+# 주의: {STATIC_BASE}/version.json 은 (지금은 보관된) 예전 '쿠키 붙여넣기' 데스크탑 앱이
+# 여전히 쓰는 파일이다. 이 신규 앱은 절대 그 파일을 덮어쓰지 않고,
+# 별도 파일(version-ezloan-desktop.json)로 자기 버전을 관리한다.
+VERSION_URL = f"{STATIC_BASE}/version-ezloan-desktop.json"
+UPDATE_CHECK_SECONDS = 60
 
 # 프로그램이 자체 관리하는 크롬(Chrome for Testing) / 프로필 위치
 _HOME = os.path.expanduser("~")
 CHROME_CACHE_DIR = os.path.join(_HOME, ".ezloan_bot", "chrome")
 CHROME_PROFILE_DIR = os.path.join(_HOME, ".ezloan_bot", "profile")
 APP_DIR = os.path.join(os.getenv("APPDATA", _HOME), "EzloanBot")
+# 재시작 후 로그인 세션 복구용: 캡처한 이지론/네이버 쿠키를 여기에 저장한다.
+SESSION_FILE = os.path.join(APP_DIR, "session.json")

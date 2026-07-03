@@ -14,6 +14,7 @@ from tkinter import scrolledtext, messagebox
 import config
 from bridge import remote_log
 from captcha_dialog import TkCaptchaHandler
+from updater import UpdaterThread
 
 
 class App:
@@ -22,6 +23,9 @@ class App:
         self.worker = None
         self._stop = threading.Event()
         self.driver = None
+        # 현재 로그인 쿠키(업데이트 재시작 시 저장 대상). 로그인/복구 성공 시 채워진다.
+        self._cookies = None
+        self._cookies_lock = threading.Lock()
 
         root.title(f"이지론 배너 자동등록 v{config.APP_VERSION}")
         root.geometry("520x430")
@@ -64,6 +68,23 @@ class App:
 
         remote_log("app_started", f"버전 {config.APP_VERSION}", force=True)
 
+        # 자동 업데이트 감시 스레드 시작(백그라운드, 메인 루프를 절대 막지 않음).
+        # 새 버전이 준비되면 등록 루프를 깔끔히 멈추고(_stop.set) 현재 쿠키를 저장한 뒤 재시작한다.
+        self.updater = UpdaterThread(
+            stop_running_loop=self._stop.set,
+            snapshot_session=self._snapshot_cookies,
+            status_cb=self.set_status,
+        )
+        self.updater.start()
+
+    def _snapshot_cookies(self):
+        with self._cookies_lock:
+            return list(self._cookies) if self._cookies else None
+
+    def _set_cookies(self, cookies):
+        with self._cookies_lock:
+            self._cookies = list(cookies) if cookies else None
+
     # ---- UI thread helpers ----------------------------------------------
     def set_status(self, text):
         self.root.after(0, self._set_status, text)
@@ -82,6 +103,34 @@ class App:
         self.log_box.configure(state=tk.DISABLED)
 
     # ---- events ----------------------------------------------------------
+    def try_recover_session(self):
+        """시작 시 자동 호출: 저장된 쿠키가 유효하면 재로그인 없이 바로 등록을 재개한다.
+
+        자동 업데이트 재시작이나 프로그램 재실행 때마다 네이버 로그인을 다시 하지 않도록,
+        이전 세션을 복구한다. 쿠키가 실제로 만료/무효일 때만 로그인 폼으로 폴백한다.
+        """
+        from session_store import validate_saved_session
+        cookies, _sess = validate_saved_session()
+        if not cookies:
+            remote_log("session_recover_none",
+                       "저장된 세션 없음/무효 - 네이버 로그인 필요", force=True)
+            return False
+        remote_log("session_recovered",
+                   f"저장된 세션 유효 - 재로그인 없이 등록 재개(쿠키 {len(cookies)}개)", force=True)
+        self._set_cookies(cookies)
+        self.set_status("이전 로그인 세션을 복구했습니다. 자동등록을 재개합니다.")
+        # 위젯 상태 변경 + 워커 시작은 Tk 스레드에서 수행한다.
+        self.root.after(0, self._begin_recovered, cookies)
+        return True
+
+    def _begin_recovered(self, cookies):
+        self._stop.clear()
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.worker = threading.Thread(
+            target=self._run_registrar, args=(cookies,), daemon=True)
+        self.worker.start()
+
     def on_start(self):
         nid = self.id_var.get().strip()
         npw = self.pw_var.get()
@@ -107,8 +156,6 @@ class App:
     def _run(self, nid, npw):
         from browser import build_driver
         from naver_login import NaverLogin
-        from ezloan_bot import Registrar
-        import os
 
         try:
             self.set_status("전용 크롬 준비 중... (최초 1회 설치, 1~2분)")
@@ -124,7 +171,7 @@ class App:
                 remote_log("login_failed", "naver login", force=True)
                 return
 
-            self.set_status("로그인 완료! 배너 자동등록을 시작합니다.")
+            self.set_status("로그인 완료! 세션을 확인합니다.")
             # 등록 API 는 이지론(ezloan.io) 세션 쿠키로 인증한다.
             # 네이버 도메인 쿠키만 있고 ezloan_sess 가 없으면 이후 등록이 전부 실패하므로,
             # 로그인 직후 반드시 이지론 도메인으로 이동한 뒤 그 도메인의 쿠키를 수집한다.
@@ -151,9 +198,33 @@ class App:
                     "등록 API 인증이 전부 실패할 것으로 예상됨.",
                     force=True,
                 )
+            # 로그인으로 얻은 쿠키를 디스크에 저장 -> 재시작/업데이트 후 재로그인 없이 복구.
+            self._set_cookies(cookies)
+            if has_sess:
+                from session_store import save_session
+                save_session(cookies, log=self.log)
+                remote_log("session_saved",
+                           f"로그인 세션 저장 완료(쿠키 {len(cookies)}개, 재시작 복구용)",
+                           force=True)
             # 로그인 후에는 브라우저가 필요 없으므로 닫아 리소스를 아낀다.
             self._quit_driver()
 
+            self._run_registrar(cookies)
+        except Exception as e:
+            import traceback
+            self.set_status(f"오류: {e}")
+            remote_log("run_error", traceback.format_exc()[:3000], force=True)
+        finally:
+            self._quit_driver()
+            self.root.after(0, self._finish)
+            self.set_status("정지됨")
+
+    def _run_registrar(self, cookies):
+        """쿠키로 등록 루프를 돈다(로그인 경로/세션 복구 경로 공용)."""
+        import os
+        from ezloan_bot import Registrar
+        try:
+            self.set_status("로그인 완료! 배너 자동등록을 시작합니다.")
             seen_path = os.path.join(config.APP_DIR, "seen-posts.json")
             registrar = Registrar(cookies, log=self.log, remote=remote_log,
                                   should_stop=self._stop.is_set, seen_path=seen_path)
@@ -163,7 +234,6 @@ class App:
             self.set_status(f"오류: {e}")
             remote_log("run_error", traceback.format_exc()[:3000], force=True)
         finally:
-            self._quit_driver()
             self.root.after(0, self._finish)
             self.set_status("정지됨")
 
