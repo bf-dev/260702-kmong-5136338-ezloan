@@ -48,12 +48,41 @@ def _safe_msg(r):
         return ""
 
 
+def _sync_csrf_header(s):
+    """요청마다 세션 쿠키 항아리(jar)의 현재 csrf_cookie_ezloan 값을 X-CSRF-TOKEN 헤더로 동기화.
+
+    CodeIgniter double-submit 방어: 헤더는 반드시 '지금 이 순간의' csrf 쿠키와 같아야 한다.
+    서버가 csrf 를 회전시키면 캡처 시점의 고정 값은 낡아 거부될 수 있으므로,
+    매 API 호출 직전 jar 에서 최신 값을 다시 읽어 헤더에 반영한다(회전이 없으면 무해).
+    """
+    try:
+        for c in s.cookies:
+            if c.name == "csrf_cookie_ezloan" and c.value:
+                s.headers["X-CSRF-TOKEN"] = c.value
+                return c.value
+    except Exception:
+        pass
+    return s.headers.get("X-CSRF-TOKEN")
+
+
 def session_from_cookies(cookies):
     s = requests.Session()
     csrf = None
     for c in cookies:
         try:
-            s.cookies.set(c["name"], c["value"], domain=(c.get("domain") or "ezloan.io").lstrip("."))
+            # 캡처된 도메인을 '있는 그대로' 유지한다. 앞의 점(.ezloan.io)을 제거하면
+            # 안 된다: 서버의 Set-Cookie 는 domain=.ezloan.io 로 오므로, 점을 떼어
+            # ezloan.io 로 넣어두면 requests 가 두 항목을 '다른 도메인'으로 취급해
+            # ezloan_sess 가 중복 저장된다. 그러면 서버가 세션을 회전시켜도(슬라이딩)
+            # 낡은 ezloan.io 값이 덮이지 않고 남아, 요청 Cookie 헤더에 낡은 값이 먼저
+            # 실려 나간다 -> 서버(PHP $_COOKIE)는 첫 값을 읽어 만료된 세션으로 판정 ->
+            # msg:"404 error" 무한 루프. 도메인을 보존하면 Set-Cookie 가 같은 항목을
+            # 정확히 '덮어써' 언제나 최신 세션 한 개만 전송된다.
+            s.cookies.set(
+                c["name"], c["value"],
+                domain=(c.get("domain") or "ezloan.io"),
+                path=(c.get("path") or "/"),
+            )
             if c["name"] == "csrf_cookie_ezloan":
                 csrf = c["value"]
         except Exception:
@@ -100,6 +129,8 @@ def list_post_ids(s, max_posts=config.MAX_POSTS):
 
 
 def _check(s, pid):
+    # CodeIgniter double-submit: 매 호출 직전 jar 의 최신 csrf 값을 헤더에 동기화(회전 대비).
+    _sync_csrf_header(s)
     r = s.get(f"{config.BASE_URL}/api/rq_addbanner_check/{pid}", timeout=12)
     try:
         return r.status_code, r.json()
@@ -180,6 +211,7 @@ def register(s, pid, company=config.COMPANY_NAME):
                 "status": code, "msg": raw_msg,
                 "session_lost": _is_session_lost_msg(msg)}
     try:
+        _sync_csrf_header(s)
         r = s.get(f"{config.BASE_URL}/api/rq_addbanner/{pid}", timeout=12)
         add = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
     except Exception as e:
@@ -330,6 +362,43 @@ class Registrar:
         except Exception:
             pass
 
+    def _heal_session(self):
+        """중복 세션 쿠키를 정리하고 /rq 재조회로 슬라이딩 세션을 갱신한다.
+
+        과거 버그(도메인 앞점 제거)로 만들어졌거나 복구된 세션에 ezloan_sess/csrf 가
+        ezloan.io 와 .ezloan.io 두 도메인으로 중복 저장돼 있으면, 서버의 최신 값(.ezloan.io)
+        대신 낡은 값(ezloan.io)이 요청에 먼저 실려 404 error 를 유발한다.
+        같은 이름의 쿠키 중 앞점 없는(호스트 전용) 항목을 제거하고, /rq 를 다시 불러
+        서버가 Set-Cookie 로 최신 세션을 심게 한 뒤 로그인 상태를 재확인한다.
+        """
+        try:
+            dupe_names = ("ezloan_sess", "csrf_cookie_ezloan")
+            # 이름별 도메인 목록 파악
+            by_name = {}
+            for c in self.s.cookies:
+                if c.name in dupe_names:
+                    by_name.setdefault(c.name, []).append(c.domain)
+            for name, domains in by_name.items():
+                has_dot = any(d.startswith(".") for d in domains)
+                # 앞점 있는(.ezloan.io) 서버 표준 항목이 있으면, 앞점 없는 낡은 중복만 제거.
+                if has_dot:
+                    for d in list(domains):
+                        if not d.startswith("."):
+                            try:
+                                self.s.cookies.clear(domain=d, path="/", name=name)
+                            except Exception:
+                                pass
+            # /rq 재조회로 슬라이딩 세션 쿠키 갱신(서버가 최신 ezloan_sess Set-Cookie 를 준다)
+            self.s.get(config.RQ_URL, timeout=10, allow_redirects=True)
+            _sync_csrf_header(self.s)
+            ok = logged_in(self.s)
+            if ok:
+                # 갱신된 단일 세션 쿠키를 디스크에도 반영.
+                self._persist_session(force=True)
+            return ok
+        except Exception:
+            return False
+
     def run(self):
         if not logged_in(self.s):
             self.log("세션이 유효하지 않습니다. 다시 로그인해 주세요.")
@@ -381,22 +450,37 @@ class Registrar:
                 # 갱신된 세션 쿠키를 주기적으로 디스크에 저장(재시작 복구가 살아있게 유지).
                 self._persist_session()
 
-                # 세션이 실제로 죽었는지 능동 점검:
-                # 연속으로 세션-없음 신호를 받으면 조용히 도는 대신 크게 알리고 중단한다.
-                if self._session_lost_streak >= 3:
+                # 세션이 실제로 죽었는지 능동 점검.
+                # 1) 먼저(연속 2회) 자가 치유 시도: 중복 세션 쿠키 정리 + /rq 재조회로
+                #    슬라이딩 세션 쿠키를 갱신한 뒤 다시 돈다(재로그인 없이 회복).
+                if self._session_lost_streak == 2:
+                    healed = self._heal_session()
+                    self.remote(
+                        "auth_selfheal",
+                        f"연속 {self._session_lost_streak}회 인증 거부 -> 중복 쿠키 정리+세션 갱신 시도"
+                        f"(logged_in={healed}).",
+                        force=True,
+                    )
+                    if healed:
+                        # 갱신 성공. 스트릭을 반만 낮춰 회복 여부를 다음 사이클로 재평가한다.
+                        self._session_lost_streak = 1
+
+                # 2) 자가 치유로도 계속 거부되면(연속 4회) 조용히 도는 대신 크게 알리고 중단한다.
+                if self._session_lost_streak >= 4:
                     if not logged_in(self.s):
-                        self.log("로그인 세션이 만료되었습니다. 프로그램을 다시 시작해 로그인해 주세요.")
+                        self.log("로그인 세션이 만료되었습니다. 프로그램을 다시 시작해 로그인해 주세요. (재로그인이 필요합니다)")
                         self.remote(
                             "session_expired",
-                            f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error'/'no permission'). "
-                            "requests 세션에 이지론 로그인 쿠키가 유효하지 않음.",
+                            f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error'/'no permission'), "
+                            "중복 쿠키 정리+세션 갱신 후에도 회복 실패. 재로그인 필요.",
                             force=True,
                         )
                         return
                     # 목록 페이지는 로그인으로 보이는데 등록 API 만 계속 거부되는 특이 상황
                     self.remote(
                         "auth_mismatch",
-                        f"목록은 로그인 상태로 보이나 등록 API 가 연속 {self._session_lost_streak}회 거부됨.",
+                        f"목록은 로그인 상태로 보이나 등록 API 가 연속 {self._session_lost_streak}회 거부됨"
+                        "(중복 쿠키 정리 후에도 지속).",
                         force=True,
                     )
                     self._session_lost_streak = 0
