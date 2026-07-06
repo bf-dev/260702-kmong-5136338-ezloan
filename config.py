@@ -3,7 +3,7 @@
 
 import os
 
-APP_VERSION = "2.3.5"
+APP_VERSION = "2.3.6"
 CUSTOMER_ID = "5136338"
 
 # 이지론
@@ -20,6 +20,19 @@ NAVER_LOGIN_URL = "https://nid.naver.com/nidlogin.login?locale=ko_KR"
 POLL_SECONDS = 1.5          # 목록 폴링 주기
 LOOKAHEAD = 6               # 프런티어 앞으로 미리 확인할 순번 수 (0=끄기)
 MAX_POSTS = 20             # 목록에서 확인할 최대 글 수
+
+# 일일 운영 시간대 (한국 시간, KST/Asia/Seoul).
+# 고객 요청(2026-07-06): "매일 오전 8시 ~ 오후 11시까지 돌려주세요".
+# 이 시간대 안에서만 등록/스크래핑 루프를 돌리고, 밖(23:00~08:00)에서는
+# 프로그램 창은 켜둔 채 API 를 두드리지 않고 대기하다가 08:00 이 되면 자동으로 재개한다.
+# 시각은 [RUN_START_HOUR, RUN_END_HOUR) 반열린 구간(시 단위)으로, 기본은 08~23시.
+# 예: 8, 23 -> 08:00:00 부터 22:59:59 까지 동작, 23:00 정각부터 대기.
+RUN_START_HOUR = 8
+RUN_END_HOUR = 23
+# 운영 시간대 자체를 끄고 24시간 돌리려면 아래를 False 로.
+RUN_WINDOW_ENABLED = True
+# 대기 상태에서 다음 시간대 진입을 확인하는 간격(초). 창은 살아있게 유지된다.
+IDLE_CHECK_SECONDS = 30
 
 # 원격 진단 / 캡차 중계용 (works.insu.ng 게이트웨이)
 WORKS_API = "https://works.insu.ng/works/api"

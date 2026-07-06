@@ -13,11 +13,39 @@
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
 import config
+
+# 한국 표준시(KST)는 UTC+9 고정(서머타임 없음). 고객 PC 의 로컬 시간대 설정이나
+# PyInstaller onefile 에 타임존 DB 가 안 실리는 문제와 무관하게 항상 KST 를 계산하려고
+# 시스템 로컬타임 대신 UTC 에 +9 를 더해 한국 시각을 얻는다.
+KST = timezone(timedelta(hours=9))
+
+
+def now_kst():
+    return datetime.now(timezone.utc).astimezone(KST)
+
+
+def in_run_window(dt=None):
+    """지금이 고객이 지정한 일일 운영 시간대(기본 08:00~23:00 KST) 안이면 True.
+
+    [RUN_START_HOUR, RUN_END_HOUR) 반열린 구간(시 단위). RUN_WINDOW_ENABLED 가 꺼져 있으면
+    항상 True(24시간 동작). 자정을 넘기는 설정(start > end)도 지원한다.
+    """
+    if not getattr(config, "RUN_WINDOW_ENABLED", True):
+        return True
+    dt = dt or now_kst()
+    h = dt.hour
+    start = config.RUN_START_HOUR
+    end = config.RUN_END_HOUR
+    if start <= end:
+        return start <= h < end
+    # 자정을 넘기는 구간(예: 22~6시)
+    return h >= start or h < end
 
 _RQ_LINK_RE = re.compile(r'/rq/(\d+)(?:["\'/?#]|$)')
 NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads"}
@@ -399,13 +427,54 @@ class Registrar:
         except Exception:
             return False
 
+    def _window_label(self):
+        return (f"{config.RUN_START_HOUR:02d}:00~{config.RUN_END_HOUR:02d}:00 KST"
+                if getattr(config, "RUN_WINDOW_ENABLED", True) else "24시간")
+
+    def _idle_outside_window(self):
+        """운영 시간대 밖이면(기본 23:00~08:00 KST) API 를 두드리지 않고 대기한다.
+
+        창/프로세스는 그대로 살려두고, IDLE_CHECK_SECONDS 마다 시각만 확인한다.
+        시간대 안으로 다시 들어오면 True 를 돌려주어 상위 루프가 정상 등록을 재개하게 한다.
+        (should_stop 이 걸리거나 시간대에 들어오면 대기를 끝낸다.)
+        """
+        if in_run_window():
+            return True
+        started = now_kst()
+        self.log(
+            f"운영 시간대({self._window_label()})가 아니어서 대기합니다. "
+            f"{config.RUN_START_HOUR:02d}시가 되면 자동으로 다시 시작합니다."
+        )
+        self.remote(
+            "idle_outside_window",
+            f"운영시간대 밖({started:%Y-%m-%d %H:%M} KST) - 등록 대기, "
+            f"창은 유지. 재개 예정 {config.RUN_START_HOUR:02d}:00 KST, 시간대={self._window_label()}",
+            force=True,
+        )
+        while not self.should_stop():
+            if in_run_window():
+                self.log(f"운영 시간대에 진입했습니다. 자동등록을 재개합니다.")
+                self.remote(
+                    "resume_in_window",
+                    f"운영시간대 재진입({now_kst():%Y-%m-%d %H:%M} KST) - 등록 재개",
+                    force=True,
+                )
+                return True
+            self._wait(config.IDLE_CHECK_SECONDS)
+        return False
+
     def run(self):
         if not logged_in(self.s):
             self.log("세션이 유효하지 않습니다. 다시 로그인해 주세요.")
             self.remote("session_invalid", "requests 세션이 이지론 로그인 상태가 아님(등록 API 인증 실패 예상)", force=True)
             return
+        # 시작 시점이 운영 시간대 밖이면(기본 23:00~08:00 KST) 로그인 상태만 확인해 두고,
+        # API 를 두드리지 않고 시간대 진입까지 대기한다(창은 유지).
+        if not self._idle_outside_window():
+            self.remote("run_stopped", "시작 대기 중 정지됨", force=True)
+            return
         self.log("자동 등록 시작됨")
-        self.remote("run_started", "폴링 루프 시작", force=True)
+        self.remote("run_started", f"폴링 루프 시작(운영시간대 {self._window_label()})", force=True)
 
         baseline = list_post_ids(self.s)
         if not self.seen:
@@ -417,6 +486,26 @@ class Registrar:
 
         while not self.should_stop():
             try:
+                # 운영 시간대(기본 08:00~23:00 KST) 밖이면 등록을 멈추고 대기한다.
+                # 창은 살아있고, 시간대 재진입 후 세션을 자가 치유한 뒤 baseline 을 다시 잡아
+                # 대기 동안 쌓인 글을 한꺼번에 재등록하지 않도록 한다(이미 처리된 것으로 간주).
+                if not in_run_window():
+                    if not self._idle_outside_window():
+                        break  # 대기 중 정지 요청
+                    self._heal_session()
+                    fresh = list_post_ids(self.s)
+                    self.seen.update(fresh)
+                    self._write_seen()
+                    for x in fresh:
+                        if str(x).isdigit() and int(x) >= frontier:
+                            frontier = int(x) + 1
+                    self._session_lost_streak = 0
+                    self.remote(
+                        "rebaseline_after_idle",
+                        f"대기 후 목록 재기준화 {len(fresh)}개, frontier={frontier}",
+                        force=True,
+                    )
+
                 self._cycle += 1
                 # 1) look-ahead
                 if config.LOOKAHEAD > 0:
