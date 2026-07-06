@@ -48,13 +48,17 @@ def in_run_window(dt=None):
     return h >= start or h < end
 
 _RQ_LINK_RE = re.compile(r'/rq/(\d+)(?:["\'/?#]|$)')
-NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads"}
+NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission"}
 # 세션이 없거나(로그인 만료/미인증) 서버가 인증을 거부할 때 나오는 신호.
 # 실측: 미인증 상태에서 /api/rq_addbanner_check 는 result:false, msg:"404 error" 를 준다.
-# ("no permission" 은 로그인은 됐으나 그 글은 등록 불가일 때 나온다 - 둘을 구분한다.)
-SESSION_LOST_MSGS = {"404 error", "no permission", "no session", "session", "login", "unauthorized"}
+# 주의: "no permission" 은 여기서 뺀다. 실측/서버 의미상 이 값은 '로그인은 됐으나
+# 이 글(또는 이 계정)은 등록 권한이 없다'는 뜻이지, 세션이 죽었다는 뜻이 아니다.
+# 이걸 세션소실로 오분류하면 세션이 멀쩡한데도 streak 이 올라가 거짓 session_expired
+# ('재로그인 필요')를 띄운다. 진짜 세션 사망 여부는 항상 logged_in() 로만 판정한다.
+SESSION_LOST_MSGS = {"404 error", "no session", "session", "login", "unauthorized"}
 _NOTE_MAP = {
-    "no permission": "login_required",
+    # 로그인은 유효하나 해당 글/계정에 등록 권한이 없음(세션소실 아님). 재시도 없이 넘긴다.
+    "no permission": "no_permission",
     "404 error": "login_required",
     "no amount": "no_banner_amount",
     "no ads": "no_ads",
@@ -620,6 +624,16 @@ class Registrar:
                 f"streak={self._session_lost_streak}"
                 + (f" body={body}" if body else ""),
                 force=(self._session_lost_streak <= 2),
+            )
+        elif note == "no_permission":
+            # 로그인은 유효하나 이 글/계정에 등록 권한 없음. 세션소실이 아니므로 streak 를
+            # 올리지 않고(거짓 session_expired 방지) 넘기되, 원인 추적을 위해 한 번은 크게 알린다.
+            self.log("이 건은 등록 권한이 없어 건너뜁니다(로그인은 유효). 이지론 계정/배너 상태를 확인해 주세요.")
+            self.remote(
+                "register_no_permission",
+                f"post={pid} status={status} msg={msg} note={note} "
+                "(로그인 유효, 계정/배너 권한 문제로 추정)",
+                force=True,
             )
         else:
             # 정상적으로 '등록 불가'인 글들(예: max/no ads 등)은 디바운스 로그.
