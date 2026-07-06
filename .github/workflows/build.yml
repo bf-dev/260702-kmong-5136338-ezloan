@@ -39,6 +39,7 @@ jobs:
           if (-not (Test-Path "$PWD\windows-verification.png")) { throw "Windows screenshot was not created" }
 
       - name: Upload Windows verification screenshot
+        continue-on-error: true   # 아티팩트 저장 용량이 차도(quota) 릴리스 배포는 계속 진행
         uses: actions/upload-artifact@v4
         with:
           name: windows-verification
@@ -49,6 +50,7 @@ jobs:
         run: file dist/*.exe
 
       - name: Upload artifact
+        continue-on-error: true   # 아티팩트 저장 용량이 차도(quota) 릴리스 배포는 계속 진행
         uses: actions/upload-artifact@v4
         with:
           name: ezloan-exe
