@@ -75,13 +75,38 @@ class NaverLogin:
 
     # ---- steps -----------------------------------------------------------
     def _open_naver_from_ezloan(self):
+        # 이지론 로그인 페이지를 열고 "네이버로 로그인" 버튼을 누른다.
+        # ezloan.io 가 일시적 서버 오류("Whoops! ... hit a snag" 류 500 페이지)를
+        # 내려주면 버튼이 아예 없어 Selenium 이 15초 후 TimeoutException 을 던졌고,
+        # 그게 그대로 튀어 앱이 원인 불명으로 멈췄다(2026-07-08 사고).
+        # 이건 우리 앱 버그가 아니라 사이트 측 일시 오류이므로, 몇 번 새로고침하며
+        # 회복을 기다리고, 그래도 안 되면 '사이트 일시 오류'라고 명확히 알린다.
         self.log("이지론 로그인 페이지 이동...")
-        self.d.get(config.LOGIN_URL)
-        time.sleep(1.5)
         before = set(self.d.window_handles)
-        WebDriverWait(self.d, 15).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, '.js-loginBtn[data-type="naver"]'))
-        ).click()
+        btn = None
+        for attempt in range(1, 5):  # 최대 4회(≈ 로드+대기 반복)
+            if self.should_stop():
+                raise WebDriverException("중지 요청으로 로그인 중단")
+            self.d.get(config.LOGIN_URL)
+            time.sleep(1.5)
+            if self._ezloan_error_page():
+                self.log(f"이지론 사이트 일시 오류 페이지 감지({attempt}/4). 잠시 후 다시 시도합니다...")
+                time.sleep(4)
+                continue
+            btn = self._safe(lambda: WebDriverWait(self.d, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, '.js-loginBtn[data-type="naver"]'))
+            ))
+            if btn is not None:
+                break
+            self.log(f"네이버 로그인 버튼을 찾지 못했습니다({attempt}/4). 페이지를 다시 불러옵니다...")
+            time.sleep(3)
+        if btn is None:
+            raise TimeoutException(
+                "이지론 로그인 페이지가 정상적으로 열리지 않았습니다. "
+                "이지론(ezloan.io) 사이트가 일시적으로 오류/점검 중일 수 있습니다. "
+                "잠시 후 [시작]을 다시 눌러 주세요."
+            )
+        btn.click()
         time.sleep(2.5)
         new = [h for h in self.d.window_handles if h not in before]
         if new:
@@ -90,6 +115,23 @@ class NaverLogin:
             lambda b: self._safe(lambda: b.find_element(By.ID, "id")) is not None
         )
         self.log("네이버 로그인 폼 확인")
+
+    def _ezloan_error_page(self):
+        """지금 이지론 페이지가 서버 오류 페이지(Whoops!/snag 류)인지 판정.
+
+        Laravel/CI 기본 오류 페이지는 로그인 폼 대신 짧은 안내문만 보여 준다.
+        정상 로그인 페이지에는 항상 '네이버로 로그인' 관련 요소가 있으므로,
+        그게 없고 오류 문구가 보이면 사이트 일시 오류로 본다.
+        """
+        try:
+            body = (self._safe(lambda: self.d.find_element(By.TAG_NAME, "body").text) or "").lower()
+        except WebDriverException:
+            return False
+        if not body:
+            return False
+        markers = ("whoops", "hit a snag", "try again later", "잠시 후 다시",
+                   "500", "server error", "점검")
+        return any(m in body for m in markers)
 
     def _force_korean(self):
         """네이버 로그인 UI(헤더 + 보안문자)를 한국어로 강제."""
