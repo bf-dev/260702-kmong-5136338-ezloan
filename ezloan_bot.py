@@ -595,16 +595,25 @@ class Registrar:
                     self._auth_mismatch_streak += 1
                     self._session_lost_streak = 0
                     if self._auth_mismatch_streak == 1:
+                        # 이지론 사이트 자체 스크립트(script.js)가 rq_addbanner 의 msg='404 error'
+                        # 를 '유료 광고를 진행 해주세요'로 렌더한다. 즉 배너 잔여 개수(실시간 문의
+                        # 배너)와 무관하게, 계정에 '진행 중인 유료 광고(메인배너 광고 상품)'가 있어야
+                        # 등록이 된다. 잔여 개수는 rq_addbanner_check 에서 이미 통과했으므로(개수는
+                        # 충분) 원인은 유료 광고 상품의 만료/미진행이다. 문구를 그 뜻으로 정확히 안내.
                         self.log(
-                            "로그인은 정상인데 배너 등록이 서버에서 거부되고 있습니다. "
-                            "이지론 계정의 유료 배너 잔여/광고 상태를 확인해 주세요. "
-                            "(로그인은 유효하므로 재로그인은 필요 없습니다. 사이트 일시 오류라면 곧 자동 회복됩니다.)"
+                            "로그인·배너 잔여 개수는 정상인데, 이지론이 '진행 중인 유료 광고'가 없다며 "
+                            "등록을 거부하고 있습니다(서버 응답: 404 error = '유료 광고를 진행 해주세요'). "
+                            "이지론 [내정보 > 광고 상품 구매 및 연장]에서 광고 상품(메인배너)이 만료(D-0)됐거나 "
+                            "중지 상태가 아닌지 확인 후 연장/재개해 주세요. "
+                            "(로그인은 유효하므로 재로그인은 필요 없습니다. 광고가 다시 진행되면 자동으로 등록이 재개됩니다.)"
                         )
                     self.remote(
                         "auth_mismatch",
-                        f"목록은 로그인 상태로 보이나 등록 API 가 계속 404 error 로 거부됨"
-                        f"(logged_in=True, 연속 {self._auth_mismatch_streak}회). "
-                        "세션 사망 아님. 계정/유료배너 상태 또는 이지론 서버 이상 추정. "
+                        f"목록은 로그인 상태로 보이나 등록 API(rq_addbanner)만 계속 404 error 로 거부됨"
+                        f"(logged_in=True, rq_addbanner_check=통과/amount 정상, 연속 {self._auth_mismatch_streak}회). "
+                        "세션 사망 아님. 확정 원인: 사이트 script.js 가 rq_addbanner 의 '404 error'를 "
+                        "'유료 광고를 진행 해주세요'로 처리 -> 계정에 진행 중인 유료 광고(메인배너 상품)가 없음/만료. "
+                        "고객이 이지론 [광고 상품 구매 및 연장]에서 광고를 연장/재개해야 함. "
                         f"backoff 폴링={self._backoff_seconds():.0f}s.",
                         force=(self._auth_mismatch_streak <= 3 or self._auth_mismatch_streak % 20 == 0),
                     )
