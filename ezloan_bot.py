@@ -48,7 +48,15 @@ def in_run_window(dt=None):
     return h >= start or h < end
 
 _RQ_LINK_RE = re.compile(r'/rq/(\d+)(?:["\'/?#]|$)')
-NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission"}
+# 실측(2026-07-10): 아직 생기지 않은(존재하지 않는) 글 번호의 /rq/{id} 페이지는 항상
+# 300~400바이트대의 빈 껍데기(실제 글 페이지는 25만 바이트대)로 온다. 이 하한을 넘지
+# 못하고 아래 글-존재 마커도 없으면 그 번호의 글은 '아직 없음'으로 확정한다.
+_POST_PAGE_MIN_BYTES = 1000
+_POST_PAGE_MARKERS = ("배너 등록을 눌러 주세요", "js-memberConfirmView", "rq_addbanner")
+NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission",
+                 # 존재하지 않는(아직 안 생긴) 글에 add 를 걸면 rq_addbanner 가 '404 error'.
+                 # 세션/유료광고 문제가 아니라 '글 없음'이므로 재시도하지 않고 건너뛴다.
+                 "post_absent"}
 # 세션이 없거나(로그인 만료/미인증) 서버가 인증을 거부할 때 나오는 신호.
 # 실측: 미인증 상태에서 /api/rq_addbanner_check 는 result:false, msg:"404 error" 를 준다.
 # 주의: "no permission" 은 여기서 뺀다. 실측/서버 의미상 이 값은 '로그인은 됐으나
@@ -170,8 +178,30 @@ def _check(s, pid):
         return r.status_code, {}
 
 
+def post_exists(s, pid):
+    """해당 글 번호가 실제로 존재하는 글인지(아직 안 생긴 미래 번호가 아닌지) 확인.
+
+    실측(2026-07-10): 존재하지 않는 미래 글 번호의 /rq/{id} 는 300~400바이트대 빈 껍데기,
+    실제 글은 25만 바이트대 + 아래 마커를 포함한다. rq_addbanner_check 는 계정의 유료광고/
+    배너 잔여만 검사하고 '글 존재'는 검사하지 않으므로(미래 번호에도 result:true 를 준다),
+    등록 전에 반드시 이 존재 확인을 거쳐야 rq_addbanner 가 '404 error'(글 없음)로 실패하며
+    프런티어가 유령 번호로 폭주하는 것을 막는다.
+    """
+    try:
+        r = s.get(f"{config.BASE_URL}/rq/{pid}", timeout=10, allow_redirects=True)
+    except Exception:
+        # 확인 실패 시엔 존재한다고 보수적으로 가정(실제 글을 놓치지 않도록).
+        return True
+    if r.status_code != 200:
+        return False
+    body = r.text or ""
+    if len(body) < _POST_PAGE_MIN_BYTES:
+        return False
+    return any(m in body for m in _POST_PAGE_MARKERS)
+
+
 def probe_state(s, pid):
-    """open / ing / absent / blocked / no_session / error"""
+    """open / ing / absent / future / blocked / no_session / error"""
     try:
         code, data = _check(s, pid)
     except Exception:
@@ -179,7 +209,9 @@ def probe_state(s, pid):
     if code != 200:
         return "error"
     if data.get("result") is True:
-        return "open"
+        # check 통과(=계정 유료광고/잔여 정상)라도, 글이 실제로 존재해야 add 가 성공한다.
+        # 미래(미존재) 번호면 rq_addbanner 가 '404 error' 를 주므로 여기서 걸러 낸다.
+        return "open" if post_exists(s, pid) else "future"
     msg = (data.get("msg") or "").strip().lower()
     # "404 error" 는 '글이 없음'이 아니라 '세션 없음' 신호다(실측). absent 로 착각하면 안 된다.
     if _is_session_lost_msg(msg):
@@ -192,17 +224,32 @@ def probe_state(s, pid):
 
 
 def lookahead_ids(s, frontier, window):
+    """프런티어 앞쪽을 미리 찔러 '실제로 존재하며 등록 가능한' 새 글 번호를 찾는다.
+
+    반환: (등록 대상 id 리스트, safe_frontier).
+    safe_frontier = '아직 안 생긴(존재하지 않는) 첫 번호'. 상위 루프는 프런티어를 이 값
+    이상으로 올리면 안 된다. 그렇지 않으면 유령(미래) 번호를 지나쳐 프런티어가 폭주하고,
+    나중에 그 번호로 실제 글이 생겨도 이미 프런티어보다 아래라 영원히 건너뛴다(핵심 버그).
+    """
     found, pid, end, absents = [], frontier, frontier + window, 0
+    safe_frontier = frontier
     while pid < end:
         st = probe_state(s, str(pid))
         if st in ("open", "ing"):
             found.append(str(pid)); absents = 0
+            safe_frontier = pid + 1  # 존재가 확인된 글까지만 프런티어를 전진시킨다.
         elif st == "blocked":
             absents = 0
+            safe_frontier = pid + 1  # 존재하나 지금은 등록 불가(권한/마감 등) - 지나가도 됨.
         elif st == "absent":
             absents += 1
+            safe_frontier = pid + 1  # 삭제/존재하지 않는 과거 번호 - 지나가도 됨.
             if absents >= 2:
                 break
+        elif st == "future":
+            # check 는 통과했지만 글이 아직 존재하지 않는 미래 번호. 여기서 멈춘다.
+            # safe_frontier 를 올리지 않으므로 프런티어가 유령 번호를 넘어가지 않는다.
+            break
         elif st == "no_session":
             # 세션이 죽었다. lookahead 를 즉시 접고 상위 루프가 세션 점검을 하게 한다.
             break
@@ -210,7 +257,7 @@ def lookahead_ids(s, frontier, window):
             break
         pid += 1
     found.sort(key=int, reverse=True)
-    return found
+    return found, safe_frontier
 
 
 def company_rank(s, pid, company=config.COMPANY_NAME):
@@ -250,6 +297,18 @@ def register(s, pid, company=config.COMPANY_NAME):
         return {"ok": False, "rank": None, "note": f"add_error:{e}", "status": None, "msg": None}
     add_msg = (add.get("msg") or "").strip()
     if r.status_code != 200 or add.get("result") is not True:
+        # 여기까지 왔다는 건 rq_addbanner_check 가 result:true 였다는 뜻이다
+        # (= 세션 유효 + 계정 유료광고/배너 잔여 정상). 그런데도 add 가 '404 error'라면
+        # 그건 세션/유료광고 문제가 아니라 '해당 글이 존재하지 않음'(아직 안 생긴 미래 번호나
+        # 삭제된 번호)이다. 실측(2026-07-10): check 는 글 존재를 검사하지 않아 미래 번호에도
+        # result:true 를 주고, add 는 글이 없으면 '404 error' 를 준다. /rq/{id} 페이지 크기로
+        # 존재를 확인해 '세션 사망'으로 오분류하지 않는다(예전 auth_mismatch/유료광고 오진의 원인).
+        low = add_msg.lower()
+        if low == "404 error" and not post_exists(s, pid):
+            return {"ok": False, "rank": None, "note": "post_absent",
+                    "status": r.status_code, "msg": add_msg,
+                    "session_lost": False,
+                    "body": (r.text or "")[:300]}
         return {"ok": False, "rank": None, "note": "add_failed",
                 "status": r.status_code, "msg": add_msg,
                 "session_lost": _is_session_lost_msg(add_msg),
@@ -528,9 +587,13 @@ class Registrar:
                 self._cycle += 1
                 # 1) look-ahead
                 if config.LOOKAHEAD > 0:
-                    for pid in lookahead_ids(self.s, frontier, config.LOOKAHEAD):
-                        if int(pid) >= frontier:
-                            frontier = int(pid) + 1
+                    ahead, safe_frontier = lookahead_ids(self.s, frontier, config.LOOKAHEAD)
+                    # 프런티어는 '존재가 확인된 번호'까지만 전진시킨다. lookahead 가 돌려준
+                    # safe_frontier 는 아직 안 생긴 첫 번호이므로, 이 값을 넘겨 올리면
+                    # 유령(미래) 번호를 지나쳐 나중에 실제 글이 생겨도 못 잡는다.
+                    if safe_frontier > frontier:
+                        frontier = safe_frontier
+                    for pid in ahead:
                         if pid in self.seen:
                             continue
                         self._handle(pid)
@@ -595,25 +658,26 @@ class Registrar:
                     self._auth_mismatch_streak += 1
                     self._session_lost_streak = 0
                     if self._auth_mismatch_streak == 1:
-                        # 이지론 사이트 자체 스크립트(script.js)가 rq_addbanner 의 msg='404 error'
-                        # 를 '유료 광고를 진행 해주세요'로 렌더한다. 즉 배너 잔여 개수(실시간 문의
-                        # 배너)와 무관하게, 계정에 '진행 중인 유료 광고(메인배너 광고 상품)'가 있어야
-                        # 등록이 된다. 잔여 개수는 rq_addbanner_check 에서 이미 통과했으므로(개수는
-                        # 충분) 원인은 유료 광고 상품의 만료/미진행이다. 문구를 그 뜻으로 정확히 안내.
+                        # 정정(2026-07-10 실측): rq_addbanner 의 '404 error' 는 '유료 광고 없음'
+                        # 을 뜻하지 않는다. rq_addbanner_check 가 유료광고/배너 잔여를 이미 통과
+                        # (result:true, amount 정상)했다면 계정·유료광고는 정상이다. 이 경우 add
+                        # '404 error' 는 대부분 '해당 글이 존재하지 않음'(아직 안 생긴 미래 번호/
+                        # 삭제된 글)이며, 이제는 post_absent 로 걸러 세션·유료광고 오진 없이 건너뛴다.
+                        # 그런데도 실제 존재하는 글에서까지 add 가 계속 404 라면 이지론 서버의 일시
+                        # 이상이 가장 유력하므로, 재로그인/유료광고 연장을 요구하지 않고 잠시 뒤 자동
+                        # 재시도한다(광고가 다시 진행되면/서버가 회복되면 자동으로 등록 재개).
                         self.log(
-                            "로그인·배너 잔여 개수는 정상인데, 이지론이 '진행 중인 유료 광고'가 없다며 "
-                            "등록을 거부하고 있습니다(서버 응답: 404 error = '유료 광고를 진행 해주세요'). "
-                            "이지론 [내정보 > 광고 상품 구매 및 연장]에서 광고 상품(메인배너)이 만료(D-0)됐거나 "
-                            "중지 상태가 아닌지 확인 후 연장/재개해 주세요. "
-                            "(로그인은 유효하므로 재로그인은 필요 없습니다. 광고가 다시 진행되면 자동으로 등록이 재개됩니다.)"
+                            "로그인·배너 잔여 개수는 정상인데 등록 API 가 일시적으로 거부되고 있습니다. "
+                            "자동으로 잠시 뒤 다시 시도합니다. (재로그인은 필요 없습니다. "
+                            "이 상태가 오래 지속되면 이지론 사이트가 일시적으로 불안정한 것일 수 있습니다.)"
                         )
                     self.remote(
                         "auth_mismatch",
-                        f"목록은 로그인 상태로 보이나 등록 API(rq_addbanner)만 계속 404 error 로 거부됨"
-                        f"(logged_in=True, rq_addbanner_check=통과/amount 정상, 연속 {self._auth_mismatch_streak}회). "
-                        "세션 사망 아님. 확정 원인: 사이트 script.js 가 rq_addbanner 의 '404 error'를 "
-                        "'유료 광고를 진행 해주세요'로 처리 -> 계정에 진행 중인 유료 광고(메인배너 상품)가 없음/만료. "
-                        "고객이 이지론 [광고 상품 구매 및 연장]에서 광고를 연장/재개해야 함. "
+                        f"실제 존재하는 글에서도 rq_addbanner 가 계속 404 로 거부됨"
+                        f"(logged_in=True, rq_addbanner_check=통과/amount 정상, post_exists=True, "
+                        f"연속 {self._auth_mismatch_streak}회). 세션 사망 아님, 유료광고/글-미존재도 아님"
+                        "(그건 post_absent 로 이미 분리). 남는 유력 원인은 이지론 서버 일시 이상. "
+                        "재로그인/광고연장 요구하지 않고 backoff 후 자동 재시도. "
                         f"backoff 폴링={self._backoff_seconds():.0f}s.",
                         force=(self._auth_mismatch_streak <= 3 or self._auth_mismatch_streak % 20 == 0),
                     )
@@ -681,6 +745,14 @@ class Registrar:
                 f"post={pid} status={status} msg={msg} note={note} "
                 "(로그인 유효, 계정/배너 권한 문제로 추정)",
                 force=True,
+            )
+        elif note == "post_absent":
+            # check 는 통과(세션/유료광고 정상)했으나 글이 아직 존재하지 않아 add 가 '404 error'.
+            # 세션 사망도 유료광고 문제도 아니다. 조용히 건너뛰고(seen 처리됨) 프런티어만 전진.
+            self.remote(
+                "register_post_absent",
+                f"post={pid} status={status} msg={msg} note={note} "
+                "(글 미존재/미래 번호 - 세션·유료광고 정상, 건너뜀)",
             )
         else:
             # 정상적으로 '등록 불가'인 글들(예: max/no ads 등)은 디바운스 로그.

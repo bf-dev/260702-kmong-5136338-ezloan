@@ -3,7 +3,7 @@
 
 import os
 
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.4.2"
 CUSTOMER_ID = "5136338"
 
 # 이지론
