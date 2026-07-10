@@ -282,6 +282,11 @@ class Registrar:
         self._cycle = 0
         self._registered_total = 0
         self._last_session_save = 0.0   # 갱신된 쿠키를 디스크에 다시 저장한 시각
+        # '목록은 로그인인데 등록 API 만 404 error 로 거부'되는 상황(auth_mismatch)의 연속 횟수.
+        # 세션이 살아있음이 logged_in() 로 확인됐는데도 등록만 계속 거부되면, 이건 세션 사망이
+        # 아니라 계정/게시글 측 등록 불가 상태다. 조용히 초당 수십 회 재시도하며 사이트를
+        # 두드리는 대신, 폴링 간격을 늘려(backoff) 부담을 줄이고 원인을 명확히 알린다.
+        self._auth_mismatch_streak = 0
         # 세션 쿠키 진단(ezloan_sess 유무). 값은 절대 로그로 보내지 않는다.
         try:
             names = sorted({c.get("name", "") for c in cookies if c.get("name")})
@@ -431,6 +436,16 @@ class Registrar:
         except Exception:
             return False
 
+    def _backoff_seconds(self):
+        """auth_mismatch 가 이어질수록 폴링 간격을 늘려 사이트 부담/차단 위험을 줄인다.
+
+        기본 POLL_SECONDS(1.5s)에서 시작해 연속 mismatch 마다 지수적으로 늘리되 60초로 캡.
+        정상(등록 재개)으로 돌아오면 _auth_mismatch_streak 가 0 이 되어 즉시 정상 주기로 복귀.
+        """
+        base = float(getattr(config, "POLL_SECONDS", 1.5))
+        n = max(0, self._auth_mismatch_streak - 1)
+        return min(60.0, base * (2 ** min(n, 5)))
+
     def _window_label(self):
         return (f"{config.RUN_START_HOUR:02d}:00~{config.RUN_END_HOUR:02d}:00 KST"
                 if getattr(config, "RUN_WINDOW_ENABLED", True) else "24시간")
@@ -558,25 +573,46 @@ class Registrar:
                         # 갱신 성공. 스트릭을 반만 낮춰 회복 여부를 다음 사이클로 재평가한다.
                         self._session_lost_streak = 1
 
-                # 2) 자가 치유로도 계속 거부되면(연속 4회) 조용히 도는 대신 크게 알리고 중단한다.
+                # 2) 자가 치유로도 계속 거부되면(연속 4회) 조용히 도는 대신 크게 알린다.
                 if self._session_lost_streak >= 4:
                     if not logged_in(self.s):
+                        # logged_in() 이 유일한 세션 사망 판정 권한이다. 여기서만 재로그인을 요구한다.
                         self.log("로그인 세션이 만료되었습니다. 프로그램을 다시 시작해 로그인해 주세요. (재로그인이 필요합니다)")
                         self.remote(
                             "session_expired",
-                            f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error'/'no permission'), "
+                            f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error'), "
                             "중복 쿠키 정리+세션 갱신 후에도 회복 실패. 재로그인 필요.",
                             force=True,
                         )
                         return
-                    # 목록 페이지는 로그인으로 보이는데 등록 API 만 계속 거부되는 특이 상황
+                    # 목록 페이지는 로그인으로 보이는데 등록 API 만 계속 404 error 로 거부되는 상황.
+                    # 세션은 살아있으므로(logged_in=True) 이건 세션 사망이 아니라 계정/게시글 측
+                    # 등록 불가 상태다(예: 유료 배너 소진, 계정 권한/정지, 이지론 서버 일시 이상).
+                    # 예전엔 이걸 매 사이클 초당 수십 회 auth_mismatch 로그로만 남기며 사이트를
+                    # 계속 두드렸다(2026-07-08 로그: 15분간 auth_mismatch 수백 회, 등록은 1건).
+                    # 이제는 backoff(폴링 간격을 늘림)로 부담을 줄이고, 원인을 사장님이 조치할 수
+                    # 있게 명확한 문구로 알린다. 세션은 살아있으니 재로그인을 요구하지 않는다.
+                    self._auth_mismatch_streak += 1
+                    self._session_lost_streak = 0
+                    if self._auth_mismatch_streak == 1:
+                        self.log(
+                            "로그인은 정상인데 배너 등록이 서버에서 거부되고 있습니다. "
+                            "이지론 계정의 유료 배너 잔여/광고 상태를 확인해 주세요. "
+                            "(로그인은 유효하므로 재로그인은 필요 없습니다. 사이트 일시 오류라면 곧 자동 회복됩니다.)"
+                        )
                     self.remote(
                         "auth_mismatch",
-                        f"목록은 로그인 상태로 보이나 등록 API 가 연속 {self._session_lost_streak}회 거부됨"
-                        "(중복 쿠키 정리 후에도 지속).",
-                        force=True,
+                        f"목록은 로그인 상태로 보이나 등록 API 가 계속 404 error 로 거부됨"
+                        f"(logged_in=True, 연속 {self._auth_mismatch_streak}회). "
+                        "세션 사망 아님. 계정/유료배너 상태 또는 이지론 서버 이상 추정. "
+                        f"backoff 폴링={self._backoff_seconds():.0f}s.",
+                        force=(self._auth_mismatch_streak <= 3 or self._auth_mismatch_streak % 20 == 0),
                     )
-                    self._session_lost_streak = 0
+                    self._wait(self._backoff_seconds())
+                    continue
+                # 등록이 다시 되기 시작하면 backoff 를 푼다.
+                if self._registered_total and self._auth_mismatch_streak:
+                    self._auth_mismatch_streak = 0
             except Exception as e:
                 import traceback
                 self.log(f"오류(계속 시도 중): {e}")
@@ -608,11 +644,13 @@ class Registrar:
         if result.get("ok") and result.get("rank"):
             self._registered_total += 1
             self._session_lost_streak = 0
+            self._auth_mismatch_streak = 0
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
             self.remote("registered", f"post={pid} rank={result['rank']} msg={msg}", force=True)
         elif result.get("ok"):
             self._registered_total += 1
             self._session_lost_streak = 0
+            self._auth_mismatch_streak = 0
             self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
         elif result.get("session_lost"):
             # 인증 실패. 실행당 1회, 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
