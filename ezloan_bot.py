@@ -56,18 +56,36 @@ _POST_PAGE_MARKERS = ("배너 등록을 눌러 주세요", "js-memberConfirmView
 NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission",
                  # 존재하지 않는(아직 안 생긴) 글에 add 를 걸면 rq_addbanner 가 '404 error'.
                  # 세션/유료광고 문제가 아니라 '글 없음'이므로 재시도하지 않고 건너뛴다.
-                 "post_absent"}
-# 세션이 없거나(로그인 만료/미인증) 서버가 인증을 거부할 때 나오는 신호.
-# 실측: 미인증 상태에서 /api/rq_addbanner_check 는 result:false, msg:"404 error" 를 준다.
-# 주의: "no permission" 은 여기서 뺀다. 실측/서버 의미상 이 값은 '로그인은 됐으나
-# 이 글(또는 이 계정)은 등록 권한이 없다'는 뜻이지, 세션이 죽었다는 뜻이 아니다.
-# 이걸 세션소실로 오분류하면 세션이 멀쩡한데도 streak 이 올라가 거짓 session_expired
-# ('재로그인 필요')를 띄운다. 진짜 세션 사망 여부는 항상 logged_in() 로만 판정한다.
-SESSION_LOST_MSGS = {"404 error", "no session", "session", "login", "unauthorized"}
+                 "post_absent",
+                 # 글은 실재하지만 이 회원 배너가 이미 있거나(재등록 불가) 지금 계정 상태로
+                 # 등록 대상이 아님. rq_addbanner 가 result:false('404 error'/'no permission')
+                 # 를 주는 개별-글 등록 거부. 세션 사망 아님 -> seen 처리하고 프런티어 전진.
+                 "add_refused"}
+# 진짜 세션 소실/미인증(로그아웃)일 때만 나오는 신호만 여기 둔다.
+# "404 error" 와 "no permission" 은 절대 넣지 않는다(아래 근거).
+#
+# 실측 근거(2026-07-10, 고객 5136338 세션으로 라이브 확인):
+#  - 이 세션은 12:43 에 rq_addbanner_check 가 success/amount:113 을 줬고 post 29950 을
+#    실제로 등록(rank 148)했다. 즉 세션·유료광고·잔여 모두 정상이었다.
+#  - 그런데 재시작으로 프런티어가 30466(look-ahead 유령 번호까지 폭주한 값)에서 실제
+#    최신글 기준 29952 로 되감겨, 이미 등록한 실재 글(29956~29981)을 다시 add 하자
+#    rq_addbanner 가 전부 '404 error' 를 줬다. 이건 세션 사망이 아니라 '이 글엔 이미
+#    내 배너가 있음/재등록 불가'라는 개별-글 거부다.
+#  - 같은 세션으로 몇 시간 뒤 다시 찔러 보면 check 가 최상단 실재 글에도 'no permission'
+#    을 준다. 쿠키는 '동일'한데 결과만 시간에 따라 바뀐다 -> 원인은 낡은 쿠키가 아니라
+#    서버측 계정 할당/기간 제한 상태다(재로그인해도 같은 계정이라 안 바뀜).
+#  - 사이트 자체 script.js 의 rq_addbanner msgMap 도 '404 error' 를 'no amount'/'no ads'/
+#    'no payed ads' 와 나란히 '유료 광고를 진행 해주세요'로 렌더할 뿐, 로그아웃시키지 않는다.
+# 따라서 '404 error'/'no permission' 을 세션소실로 오분류하면 세션이 멀쩡한데도 streak 이
+# 올라 거짓 session_expired('재로그인 필요')/auth_mismatch backoff 에 갇힌다.
+# 진짜 세션 사망 여부는 항상 logged_in()==False 로만 판정한다.
+SESSION_LOST_MSGS = {"no session", "session expired", "unauthorized", "logout", "please login"}
 _NOTE_MAP = {
-    # 로그인은 유효하나 해당 글/계정에 등록 권한이 없음(세션소실 아님). 재시도 없이 넘긴다.
+    # 로그인은 유효하나 이 글/계정이 지금 등록 대상이 아님(세션소실 아님). 재시도 없이 넘긴다.
     "no permission": "no_permission",
-    "404 error": "login_required",
+    # 개별 글 등록 거부(이미 등록됨/미존재/계정상태상 불가). register() 가 post_exists 로
+    # 실존/미존재를 갈라 post_absent(미존재) 또는 add_refused(실존·재등록불가)로 확정한다.
+    "404 error": "add_refused",
     "no amount": "no_banner_amount",
     "no ads": "no_ads",
     "no payed ads": "no_payed_ads",
@@ -213,7 +231,8 @@ def probe_state(s, pid):
         # 미래(미존재) 번호면 rq_addbanner 가 '404 error' 를 주므로 여기서 걸러 낸다.
         return "open" if post_exists(s, pid) else "future"
     msg = (data.get("msg") or "").strip().lower()
-    # "404 error" 는 '글이 없음'이 아니라 '세션 없음' 신호다(실측). absent 로 착각하면 안 된다.
+    # 진짜 세션 소실 신호(로그아웃/미인증)일 때만 no_session. '404 error'/'no permission' 은
+    # 세션 사망이 아니라 계정상태상 지금 등록 불가일 뿐이므로 아래 blocked 로 떨어뜨린다.
     if _is_session_lost_msg(msg):
         return "no_session"
     if "존재하지" in msg or "삭제" in msg:
