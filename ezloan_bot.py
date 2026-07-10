@@ -317,14 +317,21 @@ def register(s, pid, company=config.COMPANY_NAME):
     add_msg = (add.get("msg") or "").strip()
     if r.status_code != 200 or add.get("result") is not True:
         # 여기까지 왔다는 건 rq_addbanner_check 가 result:true 였다는 뜻이다
-        # (= 세션 유효 + 계정 유료광고/배너 잔여 정상). 그런데도 add 가 '404 error'라면
-        # 그건 세션/유료광고 문제가 아니라 '해당 글이 존재하지 않음'(아직 안 생긴 미래 번호나
-        # 삭제된 번호)이다. 실측(2026-07-10): check 는 글 존재를 검사하지 않아 미래 번호에도
-        # result:true 를 주고, add 는 글이 없으면 '404 error' 를 준다. /rq/{id} 페이지 크기로
-        # 존재를 확인해 '세션 사망'으로 오분류하지 않는다(예전 auth_mismatch/유료광고 오진의 원인).
+        # (= 세션 유효 + 계정 유료광고/배너 잔여 정상). 그런데도 add 가 result:false 라면
+        # 그건 세션 사망이 아니라 '이 글은 지금 등록 대상이 아님'이라는 개별-글 거부다.
+        # 두 경우로 갈린다(실측 2026-07-10):
+        #  1) 글이 실제로 없음(아직 안 생긴 미래 번호/삭제 번호): check 는 글 존재를 검사
+        #     하지 않아 미래 번호에도 통과를 주고, add 는 '404 error'. -> post_absent.
+        #  2) 글은 실재하지만 이미 내 배너가 있거나 계정상태상 등록 불가: add 가 '404 error'/
+        #     'no permission' 등. 재시작으로 프런티어가 되감겨 '이미 등록한 실재 글'을 다시
+        #     add 할 때 나온다. -> add_refused. (예전엔 이걸 세션소실로 오분류해 거짓
+        #     session_expired/auth_mismatch backoff 에 갇혔다.)
+        # 어느 쪽이든 세션 사망이 아니므로 session_lost=False. 실재 여부만 post_exists 로 가른다.
         low = add_msg.lower()
-        if low == "404 error" and not post_exists(s, pid):
-            return {"ok": False, "rank": None, "note": "post_absent",
+        if low in ("404 error", "no permission"):
+            exists = post_exists(s, pid)
+            return {"ok": False, "rank": None,
+                    "note": "add_refused" if exists else "post_absent",
                     "status": r.status_code, "msg": add_msg,
                     "session_lost": False,
                     "body": (r.text or "")[:300]}
@@ -346,13 +353,17 @@ class Registrar:
     """로그인 후 requests 세션으로 등록 루프를 돈다."""
 
     def __init__(self, cookies, log=print, remote=None, should_stop=None,
-                 seen_path=None):
+                 seen_path=None, relogin=None):
         self.s = session_from_cookies(cookies)
         self._cookies_raw = cookies or []
         self._diag_sent = False   # auth_diag_dump 는 실행당 1회만
         self.log = log
         self.remote = remote or (lambda *a, **k: None)
         self.should_stop = should_stop or (lambda: False)
+        # 강제 재로그인 콜백(선택). 등록이 '새 글'에서까지 지속적으로 거부되는데 세션은
+        # logged_in()==True 로 멀쩡한 경우, 낡은 세션(연장 전 상태를 물고 있는 쿠키)일 수
+        # 있어 새 이지론 세션을 다시 받아 오게 하는 복구 훅. 반환: 새 cookies(list) 또는 None.
+        self.relogin = relogin
         self.seen_path = Path(seen_path) if seen_path else None
         self.seen = self._read_seen()
         # 진단용 상태
@@ -360,6 +371,11 @@ class Registrar:
         self._cycle = 0
         self._registered_total = 0
         self._last_session_save = 0.0   # 갱신된 쿠키를 디스크에 다시 저장한 시각
+        # '새로 생긴(프런티어) 글'에서 add 가 거부된 연속 횟수. 이미 등록한 옛 글의 거부
+        # (add_refused, 재시작 되감김)와 구분한다. 새 글에서까지 계속 거부되면 세션 자체가
+        # 낡았을(연장 전 엔타이틀먼트를 물고 있는) 가능성이 있어 강제 재로그인 복구를 시도한다.
+        self._fresh_refuse_streak = 0
+        self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
         # '목록은 로그인인데 등록 API 만 404 error 로 거부'되는 상황(auth_mismatch)의 연속 횟수.
         # 세션이 살아있음이 logged_in() 로 확인됐는데도 등록만 계속 거부되면, 이건 세션 사망이
         # 아니라 계정/게시글 측 등록 불가 상태다. 조용히 초당 수십 회 재시도하며 사이트를
@@ -477,6 +493,40 @@ class Registrar:
         except Exception:
             pass
 
+    def _force_relogin(self):
+        """새 글에서까지 등록이 지속 거부될 때, 새 이지론 세션을 다시 받아 온다(실행당 1회).
+
+        가설(고객 문의): 광고 상품을 연장했는데도 앱이 '연장 전' 세션 쿠키를 그대로 물고
+        있어 서버가 그 세션을 미-엔타이틀먼트로 취급할 수 있다. logged_in()==True 라 세션
+        사망은 아니지만, 새 글에서까지 거부가 이어지면 세션 자체를 새로 발급받아 본다.
+        relogin 콜백은 GUI 스레드에서 네이버 재로그인을 수행하고 새 cookies(list)를 준다.
+        실측(2026-07-10)으로는 '동일 쿠키가 시간에 따라 success->no permission'으로 바뀌어
+        원인이 서버측 계정 할당일 가능성이 크지만, 낡은-세션 케이스까지 커버하는 안전장치다.
+        """
+        self._relogin_done = True
+        self.log("등록이 계속 거부되어 로그인 세션을 새로 받아옵니다(재로그인)...")
+        self.remote("force_relogin_start",
+                    "새 글에서도 등록 지속 거부(logged_in=True) -> 강제 재로그인으로 새 세션 확보 시도",
+                    force=True)
+        try:
+            new_cookies = self.relogin()
+        except Exception as e:
+            new_cookies = None
+            self.remote("force_relogin_error", f"재로그인 콜백 예외: {e}", force=True)
+        if not new_cookies:
+            self.remote("force_relogin_fail",
+                        "재로그인 실패/취소 - 기존 세션으로 계속 진행", force=True)
+            return False
+        self.s = session_from_cookies(new_cookies)
+        self._cookies_raw = new_cookies
+        self._fresh_refuse_streak = 0
+        self._persist_session(force=True)
+        ok = logged_in(self.s)
+        self.remote("force_relogin_done",
+                    f"새 세션 확보(logged_in={ok}, 쿠키 {len(new_cookies)}개). 등록 재개.",
+                    force=True)
+        return ok
+
     def _heal_session(self):
         """중복 세션 쿠키를 정리하고 /rq 재조회로 슬라이딩 세션을 갱신한다.
 
@@ -573,13 +623,25 @@ class Registrar:
         self.log("자동 등록 시작됨")
         self.remote("run_started", f"폴링 루프 시작(운영시간대 {self._window_label()})", force=True)
 
+        # 시작/재시작 재기준화: 지금 목록의 '실제 최신 글'을 기준으로 프런티어를 잡고,
+        # 현재 목록 전체를 seen 으로 흡수한다. 이렇게 하면 이후엔 '진짜 새로 생기는 글'만
+        # 등록하고, 재시작 전에 이미 처리한(등록한) 옛 글들을 다시 add 로 두드리지 않는다.
+        # (핵심 재현: 예전엔 look-ahead 로 프런티어가 유령 번호까지 폭주한 값이었다가, 재시작
+        #  때 실제 최신글 기준으로 되감겨 '이미 등록한 실재 글'을 재-add -> 전부 '404 error'
+        #  -> 등록 0 + 거짓 auth_mismatch 였다. 이제 목록을 seen 에 흡수해 재-add 를 막는다.
+        #  혹시 look-ahead 가 그런 옛 글을 집더라도 register() 가 add_refused 로 조용히 건너뛴다.)
         baseline = list_post_ids(self.s)
-        if not self.seen:
-            self.seen.update(baseline)
-            self._write_seen()
+        before = len(self.seen)
+        self.seen.update(baseline)
+        self._write_seen()
         known_max = max((int(x) for x in list(self.seen) + baseline if str(x).isdigit()), default=0)
         frontier = known_max + 1
-        self.remote("baseline", f"초기 목록 {len(baseline)}개, 최대번호={known_max}, frontier={frontier}", force=True)
+        self.remote(
+            "baseline",
+            f"초기 목록 {len(baseline)}개(seen 흡수 {len(self.seen) - before}건 추가), "
+            f"최대번호={known_max}, frontier={frontier}(재시작 시 옛 글 재등록 방지)",
+            force=True,
+        )
 
         while not self.should_stop():
             try:
@@ -737,12 +799,14 @@ class Registrar:
             self._registered_total += 1
             self._session_lost_streak = 0
             self._auth_mismatch_streak = 0
+            self._fresh_refuse_streak = 0
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
             self.remote("registered", f"post={pid} rank={result['rank']} msg={msg}", force=True)
         elif result.get("ok"):
             self._registered_total += 1
             self._session_lost_streak = 0
             self._auth_mismatch_streak = 0
+            self._fresh_refuse_streak = 0
             self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
         elif result.get("session_lost"):
             # 인증 실패. 실행당 1회, 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
@@ -773,6 +837,22 @@ class Registrar:
                 f"post={pid} status={status} msg={msg} note={note} "
                 "(글 미존재/미래 번호 - 세션·유료광고 정상, 건너뜀)",
             )
+        elif note == "add_refused":
+            # 글은 실재하는데 add 가 거부됨(이미 내 배너 있음/계정상태상 등록 불가). seen 에
+            # 들어가 재-add 는 막힌다. _handle 은 'seen 에 없는 글'에만 불리므로, 여기 온 건
+            # '새로 나타난 글'에서의 거부다. 이게 연속되면 세션이 낡아(연장 전 엔타이틀먼트를
+            # 물고 있어) 새 글도 못 붙는 경우일 수 있으니, 강제 재로그인 복구를 한 번 시도한다.
+            self._fresh_refuse_streak += 1
+            self.remote(
+                "register_add_refused",
+                f"post={pid} status={status} msg={msg} note={note} "
+                f"(글 실재하나 등록 거부 - 이미 등록됨/계정상태상 불가, 세션 사망 아님, "
+                f"새글거부연속={self._fresh_refuse_streak})",
+                force=(self._fresh_refuse_streak <= 2),
+            )
+            if (self._fresh_refuse_streak >= 3 and self.relogin
+                    and not self._relogin_done and logged_in(self.s)):
+                self._force_relogin()
         else:
             # 정상적으로 '등록 불가'인 글들(예: max/no ads 등)은 디바운스 로그.
             self.remote("register_skip", f"post={pid} status={status} msg={msg} note={note}")

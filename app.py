@@ -26,6 +26,8 @@ class App:
         # 현재 로그인 쿠키(업데이트 재시작 시 저장 대상). 로그인/복구 성공 시 채워진다.
         self._cookies = None
         self._cookies_lock = threading.Lock()
+        # 강제 재로그인 복구용 자격증명(메모리 전용). id/pw 로 시작한 경우에만 채워진다.
+        self._creds = None
 
         root.title(f"이지론 배너 자동등록 v{config.APP_VERSION}")
         root.geometry("520x430")
@@ -144,6 +146,9 @@ class App:
         if not nid or not npw:
             messagebox.showinfo("알림", "네이버 아이디와 비밀번호를 입력해 주세요.")
             return
+        # 강제 재로그인(세션 새로 발급) 복구에 쓰기 위해 자격증명을 메모리에만 보관한다.
+        # 디스크/로그에는 절대 저장하지 않는다.
+        self._creds = (nid, npw)
         self._stop.clear()
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -234,7 +239,8 @@ class App:
             self.set_status("로그인 완료! 배너 자동등록을 시작합니다.")
             seen_path = os.path.join(config.APP_DIR, "seen-posts.json")
             registrar = Registrar(cookies, log=self.log, remote=remote_log,
-                                  should_stop=self._stop.is_set, seen_path=seen_path)
+                                  should_stop=self._stop.is_set, seen_path=seen_path,
+                                  relogin=self._forced_relogin)
             registrar.run()
         except Exception as e:
             import traceback
@@ -243,6 +249,76 @@ class App:
         finally:
             self.root.after(0, self._finish)
             self.set_status("정지됨")
+
+    def _forced_relogin(self):
+        """강제 재로그인 복구 콜백. Registrar 가 등록 지속 거부 시 호출한다(등록 스레드에서 실행).
+
+        낡은/연장-전 세션 쿠키 가설(H2)을 위한 복구: 디스크의 캐시 세션을 지우고
+        네이버->이지론으로 '새' 로그인을 수행해 새 ezloan 세션 쿠키를 받아온다.
+        새 cookies(list[dict]) 를 반환하면 Registrar 가 그 세션으로 등록을 이어간다.
+        자격증명이 없으면(세션 복구로만 시작한 경우) None 을 돌려주고 기존 세션을 유지한다.
+        """
+        creds = self._creds
+        if not creds:
+            remote_log(
+                "forced_relogin_no_creds",
+                "강제 재로그인 요청됐으나 저장된 자격증명 없음(세션 복구로 시작). "
+                "기존 세션 유지. 새로 로그인하려면 [정지] 후 아이디/비밀번호로 [시작].",
+                force=True,
+            )
+            return None
+        nid, npw = creds
+        from browser import build_driver
+        from naver_login import NaverLogin
+        from session_store import clear_session, save_session
+
+        driver = None
+        try:
+            # 낡은 세션이 원인일 수 있으므로 캐시 세션을 먼저 비운다(강제 FRESH 로그인).
+            clear_session()
+            self.set_status("등록이 계속 거부되어 로그인 세션을 새로 발급받는 중...")
+            driver = build_driver(headless=False, log=self.log)
+            captcha = TkCaptchaHandler(self.root, log=self.log, should_stop=self._stop.is_set)
+            login = NaverLogin(driver, log=self.log, captcha_callback=captcha,
+                               should_stop=self._stop.is_set)
+            # 캐시 세션을 지웠으므로 ezloan_logged_in() 이 아직 True 를 줄 수 있다(브라우저
+            # 프로필에 남은 쿠키). 그래도 login() 은 이지론 세션이 인증돼 있으면 그 세션을
+            # 그대로 쓰고, 아니면 네이버 폼으로 새로 로그인한다. 어느 쪽이든 아래에서 이지론
+            # 도메인으로 이동해 '지금 유효한' 쿠키를 다시 수집하므로 최신 세션을 확보한다.
+            if not login.login(nid, npw):
+                remote_log("forced_relogin_login_fail", "네이버 재로그인 실패/취소", force=True)
+                return None
+            try:
+                driver.get(config.RQ_URL)
+                import time as _t
+                _t.sleep(1.0)
+            except Exception:
+                pass
+            cookies = driver.get_cookies()
+            ez = [c for c in cookies if "ezloan" in (c.get("domain") or "")]
+            has_sess = any(("ezloan_sess" in (c.get("name") or "") or
+                            "ci_session" in (c.get("name") or "")) for c in ez)
+            remote_log(
+                "forced_relogin_cookies",
+                f"재로그인 후 전체쿠키 {len(cookies)}개, ezloan {len(ez)}개, "
+                f"ezloan_sess={'있음' if has_sess else '없음'}",
+                force=True,
+            )
+            if not has_sess:
+                return None
+            self._set_cookies(cookies)
+            save_session(cookies, log=self.log)
+            return cookies
+        except Exception as e:
+            import traceback
+            remote_log("forced_relogin_error", traceback.format_exc()[:1500], force=True)
+            return None
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
     def _quit_driver(self):
         if self.driver is not None:
