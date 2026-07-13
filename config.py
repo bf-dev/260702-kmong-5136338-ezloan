@@ -3,7 +3,7 @@
 
 import os
 
-APP_VERSION = "2.4.2"
+APP_VERSION = "2.4.3"
 CUSTOMER_ID = "5136338"
 
 # 이지론
@@ -20,6 +20,10 @@ NAVER_LOGIN_URL = "https://nid.naver.com/nidlogin.login?locale=ko_KR"
 POLL_SECONDS = 1.5          # 목록 폴링 주기
 LOOKAHEAD = 6               # 프런티어 앞으로 미리 확인할 순번 수 (0=끄기)
 MAX_POSTS = 20             # 목록에서 확인할 최대 글 수
+# 새 글마다 연속 'no permission' 거부가 이 횟수 이상 쌓였을 때만 계정 힌트를 1회 알린다.
+# 그 미만의 개별-글 스킵은 조용히(중립 문구로) 넘겨 고객에게 '계정/배너 확인' 재알람을 주지
+# 않는다(고객 이력: 계정 정상인데도 그 문구가 불필요한 불안을 유발함).
+NO_PERM_WARN_STREAK = 5
 
 # 일일 운영 시간대 (한국 시간, KST/Asia/Seoul).
 # 고객 재요청(2026-07-10): "제가 직접 정지시키지 않는 이상 24시간 돌아가도록" -

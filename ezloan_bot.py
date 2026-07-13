@@ -239,7 +239,16 @@ def probe_state(s, pid):
         return "absent"
     if msg == "ing":
         return "ing"
-    return "blocked"
+    # result:false + (세션소실/삭제/ing 아님) = 계정상태상 지금 등록 불가(예: 'no permission',
+    # '404 error'). 여기서 반드시 글 실존을 확인한다. rq_addbanner_check 는 '글 존재'를 검사
+    # 하지 않고 계정 상태만 본다(미래 번호에도 동일 응답). 따라서 계정이 'no permission' 상태로
+    # 들어가면 실재 글이든 아직 안 생긴 미래 번호든 전부 이 분기로 떨어진다. 존재 확인 없이
+    # 이를 'blocked'(지나가도 됨)로 처리하면, look-ahead 가 미래(유령) 번호를 blocked 로 보고
+    # safe_frontier 를 끝없이 밀어 프런티어가 실제 최신글보다 수백~수천 위로 폭주한다(실측
+    # 2026-07-13: 계정 no_permission 중 프런티어 30031->31213, 미존재 번호로 +6/사이클 runaway).
+    # 그러면 나중에 실제 새 글이 생겨도 이미 프런티어보다 아래라 look-ahead 가 못 잡아 즉시-등록
+    # (상위 노출)을 놓친다. 실존이 확인된 글만 blocked(전진 가능), 미존재면 future(전진 금지).
+    return "blocked" if post_exists(s, pid) else "future"
 
 
 def lookahead_ids(s, frontier, window):
@@ -375,6 +384,11 @@ class Registrar:
         # (add_refused, 재시작 되감김)와 구분한다. 새 글에서까지 계속 거부되면 세션 자체가
         # 낡았을(연장 전 엔타이틀먼트를 물고 있는) 가능성이 있어 강제 재로그인 복구를 시도한다.
         self._fresh_refuse_streak = 0
+        # 새 글에서 'no permission'(계정상태상 등록 대상 아님) 이 연속된 횟수. 개별-글 스킵은
+        # 조용히 넘기고(고객의 계정은 멀쩡하므로 매번 '계정/배너 확인' 재알람을 띄우지 않는다),
+        # '진짜 새로 생긴 글마다 전부' 거부되는 경우에만(=연속 임계 초과) 계정 힌트를 한 번 알린다.
+        self._no_perm_streak = 0
+        self._no_perm_warned = False   # 계정 힌트 알림은 상태당 1회만(재알람 방지)
         self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
         # '목록은 로그인인데 등록 API 만 404 error 로 거부'되는 상황(auth_mismatch)의 연속 횟수.
         # 세션이 살아있음이 logged_in() 로 확인됐는데도 등록만 계속 거부되면, 이건 세션 사망이
@@ -666,6 +680,26 @@ class Registrar:
                     )
 
                 self._cycle += 1
+                # 0) 프런티어 자가 보정(runaway 회복): 프런티어는 '실제 최신 글 + 1'을 기준으로
+                # look-ahead 창(LOOKAHEAD)만큼만 앞서야 한다. 계정이 잠시 no_permission 상태에
+                # 빠지는 등으로 과거에 프런티어가 미존재(유령) 번호까지 폭주했다면, 재시작 없이도
+                # 여기서 실제 목록 기준으로 되돌린다. 목록의 글은 이미 seen 에 흡수되므로 되돌려도
+                # 재-add 가 나지 않고, look-ahead 가 다시 '진짜 새 글'을 즉시 잡을 수 있게 된다.
+                # (되돌리는 하한은 실제 최신글 바로 다음 번호. 그보다 낮추지 않아 옛 글 재처리 없음.)
+                probe_ids = list_post_ids(self.s)
+                real_max = max((int(x) for x in probe_ids if str(x).isdigit()), default=0)
+                if real_max:
+                    sane_frontier = real_max + 1
+                    # 정상 앞섬(창 크기)보다 크게 벗어났을 때만 되돌린다(정상 미세 앞섬은 유지).
+                    if frontier > sane_frontier + config.LOOKAHEAD:
+                        self.remote(
+                            "frontier_resync",
+                            f"프런티어 폭주 감지: frontier={frontier} > 실제최신({real_max})+1+창"
+                            f"({sane_frontier + config.LOOKAHEAD}). "
+                            f"실제 목록 기준 frontier={sane_frontier} 로 되돌림(옛 글 재처리 없음).",
+                            force=True,
+                        )
+                        frontier = sane_frontier
                 # 1) look-ahead
                 if config.LOOKAHEAD > 0:
                     ahead, safe_frontier = lookahead_ids(self.s, frontier, config.LOOKAHEAD)
@@ -800,6 +834,8 @@ class Registrar:
             self._session_lost_streak = 0
             self._auth_mismatch_streak = 0
             self._fresh_refuse_streak = 0
+            self._no_perm_streak = 0
+            self._no_perm_warned = False
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
             self.remote("registered", f"post={pid} rank={result['rank']} msg={msg}", force=True)
         elif result.get("ok"):
@@ -807,6 +843,8 @@ class Registrar:
             self._session_lost_streak = 0
             self._auth_mismatch_streak = 0
             self._fresh_refuse_streak = 0
+            self._no_perm_streak = 0
+            self._no_perm_warned = False
             self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
         elif result.get("session_lost"):
             # 인증 실패. 실행당 1회, 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
@@ -820,15 +858,41 @@ class Registrar:
                 force=(self._session_lost_streak <= 2),
             )
         elif note == "no_permission":
-            # 로그인은 유효하나 이 글/계정에 등록 권한 없음. 세션소실이 아니므로 streak 를
-            # 올리지 않고(거짓 session_expired 방지) 넘기되, 원인 추적을 위해 한 번은 크게 알린다.
-            self.log("이 건은 등록 권한이 없어 건너뜁니다(로그인은 유효). 이지론 계정/배너 상태를 확인해 주세요.")
+            # 로그인은 유효하나 이 글이 지금 이 계정의 등록 대상이 아님(개별-글 스킵). 세션소실이
+            # 아니므로 session_lost streak 는 올리지 않는다(거짓 session_expired 방지).
+            #
+            # 재알람 방지(고객 이력): 이 고객은 예전에 '이지론 계정/배너 상태 확인'이 오진이었고
+            # (계정은 정상, D-35, 수동 등록 정상), 그 문구가 불필요한 불안을 줬다. 그러므로 '한 건
+            # 스킵'을 계정/배너 문제로 단정해 매번 확인을 요구하지 않는다. 개별-글 스킵은 조용히
+            # (중립 문구로) 넘긴다. 계정 관련 힌트는 '진짜 새로 생긴 글마다 전부' 거부될 때만
+            # (=연속 임계 초과) 딱 한 번 띄운다(실제 증거가 있을 때만).
+            self._no_perm_streak += 1
+            self.log("이미 처리했거나 지금 등록 대상이 아닌 건이라 건너뜁니다. (로그인·자동등록은 정상 동작 중)")
             self.remote(
                 "register_no_permission",
                 f"post={pid} status={status} msg={msg} note={note} "
-                "(로그인 유효, 계정/배너 권한 문제로 추정)",
-                force=True,
+                f"(로그인 유효, 이 글은 현재 등록 대상 아님 - 개별-글 스킵, "
+                f"새글연속거부={self._no_perm_streak})",
+                # 개별 스킵은 조용히(디바운스), 연속 거부가 쌓일 때만 크게 알린다.
+                force=(self._no_perm_streak >= config.NO_PERM_WARN_STREAK),
             )
+            # 새로 생기는 글마다 계속(임계 이상) 거부되면, 그건 개별-글이 아니라 계정 측
+            # 등록 자격 문제일 수 있다. 이때만 계정 힌트를 딱 한 번 알린다(재알람 방지).
+            if (self._no_perm_streak >= config.NO_PERM_WARN_STREAK
+                    and not self._no_perm_warned):
+                self._no_perm_warned = True
+                self.log(
+                    "새로 올라오는 글마다 계속 '등록 대상 아님'으로 거부되고 있습니다. "
+                    "로그인은 정상이니 재로그인은 필요 없고, 이지론 광고 상품 상태(진행 여부/기간)를 "
+                    "한 번 확인해 주세요. (상태가 정상이면 자동으로 등록이 재개됩니다.)"
+                )
+                self.remote(
+                    "no_permission_persistent",
+                    f"새 글에서 연속 {self._no_perm_streak}회 'no permission' 거부 "
+                    "(logged_in=True). 개별-글이 아니라 계정 측 등록 자격 문제 가능성 - "
+                    "계정 힌트 1회 알림.",
+                    force=True,
+                )
         elif note == "post_absent":
             # check 는 통과(세션/유료광고 정상)했으나 글이 아직 존재하지 않아 add 가 '404 error'.
             # 세션 사망도 유료광고 문제도 아니다. 조용히 건너뛰고(seen 처리됨) 프런티어만 전진.
