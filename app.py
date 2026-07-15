@@ -167,8 +167,9 @@ class App:
     # ---- worker ----------------------------------------------------------
     def _run(self, nid, npw):
         from browser import build_driver
-        from naver_login import NaverLogin
+        from naver_login import NaverLogin, LoginTemporarilyUnavailable
 
+        self._last_status_final = False  # finally 의 "정지됨" 이 차분한 안내를 덮지 않도록
         try:
             self.set_status("전용 크롬 준비 중... (최초 1회 설치, 1~2분)")
             self.driver = build_driver(headless=False, log=self.log)
@@ -177,7 +178,20 @@ class App:
             captcha = TkCaptchaHandler(self.root, log=self.log, should_stop=self._stop.is_set)
             login = NaverLogin(self.driver, log=self.log, captcha_callback=captcha,
                                should_stop=self._stop.is_set)
-            ok = login.login(nid, npw)
+            try:
+                ok = login.login(nid, npw)
+            except LoginTemporarilyUnavailable as e:
+                # 재시도까지 다 소진한 일시 지연/오류. raw 트레이스백으로 앱을 죽이지 않고
+                # 차분한 안내만 남긴 뒤, 창을 살려 사용자가 [시작]을 다시 누르게 한다.
+                self.set_status(
+                    "로그인 페이지가 잠시 느립니다. 이지론/네이버가 일시적으로 지연된 것 같아요. "
+                    "잠시 후 [시작]을 다시 눌러 주세요."
+                )
+                remote_log("login_temporarily_unavailable",
+                           f"로그인 재시도 소진(일시 지연/오류). detail={str(e)[:400]}",
+                           force=True)
+                self._last_status_final = True
+                return
             if not ok:
                 self.set_status("로그인 실패. 아이디/비밀번호를 확인해 주세요.")
                 remote_log("login_failed", "naver login", force=True)

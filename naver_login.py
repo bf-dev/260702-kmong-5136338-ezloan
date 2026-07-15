@@ -31,6 +31,15 @@ from selenium.common.exceptions import (
 import config
 
 
+class LoginTemporarilyUnavailable(Exception):
+    """로그인 페이지가 (재시도까지 다 소진하도록) 일시적으로 느리거나 오류였음.
+
+    이건 우리 앱 버그가 아니라 이지론/네이버 측 일시 지연/오류이므로,
+    호출부(app.py)는 이 예외를 raw 트레이스백으로 죽이지 말고 차분한 한국어 안내로
+    바꿔 사용자에게 '잠시 후 [시작]을 다시' 안내하고 앱 창은 살려 둔다.
+    """
+
+
 class NaverLogin:
     def __init__(self, driver, log=print, captcha_callback=None, should_stop=None):
         self.d = driver
@@ -39,16 +48,77 @@ class NaverLogin:
         self.should_stop = should_stop or (lambda: False)
 
     # ---- public ----------------------------------------------------------
+    # 로그인 페이지(이지론 로그인 폼 / 네이버 로그인 폼)가 순간적으로 느려
+    # Selenium wait 이 TimeoutException 을 던지면, 예전(v2.4.3 이하)에는 그게
+    # 그대로 튀어 app.py 의 run_error 로 잡히며 앱 실행이 통째로 멈췄다.
+    # (2026-07-08, 2026-07-15 사고: naver_login.py:114 의 네이버 폼 대기 타임아웃)
+    # 실제로는 재시작하면 곧 잘 되는 '일시적 지연'이므로, 여기서 로그인 시퀀스
+    # (이지론 로그인 페이지 열기 -> 네이버 폼 -> 자격증명 -> 제출)을 몇 번 재시도한다.
+    LOGIN_ATTEMPTS = 4          # 전체 로그인 시퀀스 재시도 횟수
+    LOGIN_RETRY_BACKOFF = 4.0   # 재시도 사이 기본 대기(초). 시도마다 조금씩 늘린다.
+
     def login(self, naver_id, naver_pw):
-        """이지론 -> 네이버 로그인 전체 플로우. 성공하면 True."""
+        """이지론 -> 네이버 로그인 전체 플로우. 성공하면 True.
+
+        일시적 TimeoutException(페이지 지연/오류)은 삼켜서 몇 번 재시도한다.
+        재시도까지 다 소진하면 LoginTemporarilyUnavailable 을 던져 호출부가
+        raw 트레이스백 대신 차분한 안내를 하도록 한다.
+        """
         if self.ezloan_logged_in():
             self.log("이미 로그인되어 있습니다.")
             return True
-        self._open_naver_from_ezloan()
-        self._force_korean()
-        self._fill_credentials(naver_id, naver_pw)
-        self._click_login()
-        return self._outcome_loop(naver_id, naver_pw)
+
+        last_err = None
+        for attempt in range(1, self.LOGIN_ATTEMPTS + 1):
+            if self.should_stop():
+                self.log("중지 요청으로 로그인 중단")
+                return False
+            try:
+                self._open_naver_from_ezloan()
+                self._force_korean()
+                self._fill_credentials(naver_id, naver_pw)
+                self._click_login()
+                return self._outcome_loop(naver_id, naver_pw)
+            except TimeoutException as e:
+                last_err = e
+                # 이미 이지론 세션이 서 있으면(폼 대기만 실패한 경우) 성공으로 본다.
+                if self._safe(self.ezloan_logged_in):
+                    self.log("네이버 로그인 폼 대기는 지연됐지만 이지론 세션이 확인됨 ✅")
+                    return True
+                if attempt >= self.LOGIN_ATTEMPTS:
+                    break
+                wait_s = self.LOGIN_RETRY_BACKOFF * attempt
+                self.log(
+                    f"로그인 페이지가 잠시 느립니다({attempt}/{self.LOGIN_ATTEMPTS}). "
+                    f"{int(wait_s)}초 후 자동으로 다시 시도합니다..."
+                )
+                self._sleep_interruptible(wait_s)
+                continue
+            except WebDriverException as e:
+                # 중지 요청으로 인한 중단은 그대로 실패 처리(재시도 무의미).
+                if self.should_stop():
+                    self.log("중지 요청으로 로그인 중단")
+                    return False
+                last_err = e
+                if attempt >= self.LOGIN_ATTEMPTS:
+                    break
+                wait_s = self.LOGIN_RETRY_BACKOFF * attempt
+                self.log(
+                    f"로그인 중 브라우저 오류가 잠시 발생했습니다({attempt}/{self.LOGIN_ATTEMPTS}). "
+                    f"{int(wait_s)}초 후 다시 시도합니다..."
+                )
+                self._sleep_interruptible(wait_s)
+                continue
+
+        raise LoginTemporarilyUnavailable(str(last_err) if last_err else "로그인 페이지 지연")
+
+    def _sleep_interruptible(self, seconds):
+        """중지 요청이 오면 즉시 깨어나는 대기."""
+        end = time.time() + max(0.0, seconds)
+        while time.time() < end:
+            if self.should_stop():
+                return
+            time.sleep(0.5)
 
     def ezloan_logged_in(self):
         """이지론 창으로 전환해 인증 여부 확인."""
@@ -111,9 +181,18 @@ class NaverLogin:
         new = [h for h in self.d.window_handles if h not in before]
         if new:
             self.d.switch_to.window(new[-1])
-        WebDriverWait(self.d, 20).until(
-            lambda b: self._safe(lambda: b.find_element(By.ID, "id")) is not None
-        )
+        # 네이버 로그인 폼(#id) 이 뜰 때까지 대기. 여기서의 TimeoutException 이
+        # 바로 2026-07-08/07-15 크래시 지점이었다. 이제는 login() 재시도 루프가
+        # 이 예외를 잡아 이지론 로그인 페이지부터 다시 시도하므로, 여기서는
+        # 명확한 메시지를 실어 TimeoutException 을 던지기만 한다.
+        try:
+            WebDriverWait(self.d, 20).until(
+                lambda b: self._safe(lambda: b.find_element(By.ID, "id")) is not None
+            )
+        except TimeoutException:
+            raise TimeoutException(
+                "네이버 로그인 폼이 제때 열리지 않았습니다(네이버/이지론 일시 지연)."
+            )
         self.log("네이버 로그인 폼 확인")
 
     def _ezloan_error_page(self):
