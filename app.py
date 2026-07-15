@@ -169,7 +169,9 @@ class App:
         from browser import build_driver
         from naver_login import NaverLogin, LoginTemporarilyUnavailable
 
-        self._last_status_final = False  # finally 의 "정지됨" 이 차분한 안내를 덮지 않도록
+        # 참고: 로그인 일시지연 시의 차분한 안내는 set_status()->_append() 로 이미
+        # 스크롤 로그에 남는다. finally 가 상태줄을 "정지됨" 으로 바꿔도(시작 재활성)
+        # 그 안내 문장은 로그에 그대로 보이므로 별도 상태줄 플래그는 두지 않는다.
         try:
             self.set_status("전용 크롬 준비 중... (최초 1회 설치, 1~2분)")
             self.driver = build_driver(headless=False, log=self.log)
@@ -190,7 +192,6 @@ class App:
                 remote_log("login_temporarily_unavailable",
                            f"로그인 재시도 소진(일시 지연/오류). detail={str(e)[:400]}",
                            force=True)
-                self._last_status_final = True
                 return
             if not ok:
                 self.set_status("로그인 실패. 아이디/비밀번호를 확인해 주세요.")

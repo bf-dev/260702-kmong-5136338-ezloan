@@ -23,11 +23,15 @@ jobs:
         run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, captcha_dialog, session_store, updater, app; print('imports ok')"
 
       - name: Verify 24/7 + frontier behavior (no regression)
+        env:
+          PYTHONIOENCODING: utf-8   # Windows 콘솔 cp1252 에서 한국어 print 크래시 방지
         run: |
           python verify_247.py
           python repro_frontier_runaway.py
 
       - name: Verify login resilience (TimeoutException retries, no crash)
+        env:
+          PYTHONIOENCODING: utf-8
         run: python verify_login_resilient.py
 
       - name: Build exe
