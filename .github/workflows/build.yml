@@ -34,6 +34,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python verify_login_resilient.py
 
+      - name: Verify error-page detector (no false-positive on real login page)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python verify_error_page_detector.py
+
       - name: Build exe
         run: >
           pyinstaller --onefile --noconsole

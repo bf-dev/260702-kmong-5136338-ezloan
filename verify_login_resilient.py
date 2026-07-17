@@ -16,14 +16,28 @@ from naver_login import NaverLogin, LoginTemporarilyUnavailable
 class _Harness(NaverLogin):
     """실제 login() 재시도 루프를 그대로 타되, 브라우저를 건드리는 내부 스텝만 가짜로 바꾼다."""
 
-    def __init__(self, fail_first=0, fail_kind="timeout", **kw):
+    def __init__(self, fail_first=0, fail_kind="timeout", budget=100.0, **kw):
         super().__init__(driver=object(), **kw)
-        # 재시도 대기를 0으로 만들어 테스트를 빠르게(동작은 동일).
-        self.LOGIN_RETRY_BACKOFF = 0.0
+        # v2.4.5: login() 은 성공/정지/예산소진까지 계속 자동 재시도한다. 실제 벽시계로
+        # 검증하면 CI 가 오래 걸리고 불안정하므로, 이 하네스는 '가짜 시계'를 쓴다.
+        # _sleep_interruptible 가 호출될 때마다 가짜 시계를 그만큼 앞으로 감아,
+        # 대기 예산(budget) 소진 경로를 결정론적으로/즉시 검증한다.
+        self.LOGIN_RETRY_BACKOFF = 4.0
+        self.LOGIN_LONG_RETRY_WAIT = 45.0
+        self.LOGIN_TOTAL_BUDGET = budget
         self._fail_first = fail_first
         self._fail_kind = fail_kind
         self.open_calls = 0
         self.reached_outcome = False
+        self._fake_now = 1000.0
+
+    # 가짜 시계: login() 이 참조하는 time.time() 을 결정론적으로 통제한다.
+    def _time(self):
+        return self._fake_now
+
+    def _sleep_interruptible(self, seconds):
+        # 실제로 자지 않고 가짜 시계만 앞으로 감는다(대기 예산이 유한 시간에 소진됨).
+        self._fake_now += max(0.0, seconds)
 
     # login() 이 성공 판정 전 부르는 캐시 세션 체크: 처음부터 로그인돼 있진 않다.
     def ezloan_logged_in(self):
@@ -77,8 +91,12 @@ def test_webdriver_error_retries_then_succeeds():
 
 def test_exhausted_raises_calm_exception_not_traceback():
     """모든 시도가 타임아웃 -> app.py 를 죽이는 raw TimeoutException 이 아니라
-       LoginTemporarilyUnavailable 로 끝나야 한다(호출부가 차분한 안내로 변환)."""
-    h = _Harness(fail_first=99, fail_kind="timeout")
+       LoginTemporarilyUnavailable 로 끝나야 한다(호출부가 차분한 안내로 변환).
+
+       v2.4.5: login() 은 4번 만에 포기하지 않고 예산(LOGIN_TOTAL_BUDGET)까지
+       계속 자동 재시도한다. 그래서 (a) 초기 짧은 재시도(LOGIN_ATTEMPTS)보다 많이
+       시도했고 (b) 예산 소진 후에야 차분한 예외로 끝나는지 확인한다."""
+    h = _Harness(fail_first=99999, fail_kind="timeout", budget=600.0)
     try:
         h.login("someid", "somepw")
     except LoginTemporarilyUnavailable:
@@ -89,10 +107,21 @@ def test_exhausted_raises_calm_exception_not_traceback():
         )
     else:
         raise AssertionError("예외 없이 통과 -> 재시도 소진 처리 안 됨")
-    # LOGIN_ATTEMPTS 만큼만 시도하고 멈춰야 한다(무한 재시도 금지).
-    assert h.open_calls == h.LOGIN_ATTEMPTS, (
-        f"expected {h.LOGIN_ATTEMPTS} attempts, got {h.open_calls}"
+    # 4번 만에 포기하지 않고(v2.4.4 회귀 방지) 초기 재시도 횟수보다 더 시도했어야 한다.
+    assert h.open_calls > h.LOGIN_ATTEMPTS, (
+        f"expected more than {h.LOGIN_ATTEMPTS} auto-retries before giving up, "
+        f"got {h.open_calls} (v2.4.4 처럼 너무 일찍 포기함)"
     )
+
+
+def test_keeps_retrying_past_initial_attempts_then_succeeds():
+    """v2.4.5 핵심: 초기 짧은 재시도(LOGIN_ATTEMPTS=6)를 넘겨 8번째에 성공해도
+       [시작] 재클릭 없이 자동으로 성공해야 한다(수동 재시도 제거)."""
+    h = _Harness(fail_first=7, fail_kind="timeout", budget=100000.0)
+    ok = h.login("someid", "somepw")
+    assert ok is True, f"expected True, got {ok!r}"
+    assert h.open_calls == 8, f"expected 8 attempts (7 fail + 1 ok), got {h.open_calls}"
+    assert h.open_calls > h.LOGIN_ATTEMPTS, "did not retry past the initial short-retry window"
 
 
 def test_app_run_converts_to_calm_status_and_survives():
@@ -169,6 +198,8 @@ if __name__ == "__main__":
     _run("retries then succeeds (timeout x2 -> ok)", test_retries_then_succeeds)
     _run("retries then succeeds (webdriver error x1 -> ok)",
          test_webdriver_error_retries_then_succeeds)
+    _run("keeps auto-retrying past initial window -> succeeds (no manual re-click)",
+         test_keeps_retrying_past_initial_attempts_then_succeeds)
     _run("exhausted -> LoginTemporarilyUnavailable (no raw traceback, no crash)",
          test_exhausted_raises_calm_exception_not_traceback)
     _run("app._run catches it -> calm status, no run_error, app survives",

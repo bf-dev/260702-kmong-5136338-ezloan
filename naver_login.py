@@ -54,63 +54,84 @@ class NaverLogin:
     # (2026-07-08, 2026-07-15 사고: naver_login.py:114 의 네이버 폼 대기 타임아웃)
     # 실제로는 재시작하면 곧 잘 되는 '일시적 지연'이므로, 여기서 로그인 시퀀스
     # (이지론 로그인 페이지 열기 -> 네이버 폼 -> 자격증명 -> 제출)을 몇 번 재시도한다.
-    LOGIN_ATTEMPTS = 4          # 전체 로그인 시퀀스 재시도 횟수
-    LOGIN_RETRY_BACKOFF = 4.0   # 재시도 사이 기본 대기(초). 시도마다 조금씩 늘린다.
+    # v2.4.5: 예전(v2.4.4)에는 4번 짧게 재시도하고 포기한 뒤 사용자에게 [시작]을
+    # 다시 누르라고 안내했다. 황금연휴처럼 이지론/네이버가 순간적으로 느릴 때는
+    # 이 4번이 1분 안에 소진돼(백오프 4/8/12/16초), 실제로는 사이트가 곧 회복되는데도
+    # 고객이 [시작]을 몇 번씩 손으로 다시 눌러야 했다(2026-07-17 사고: 고객이
+    # "계속 다시 해보니 됐네용" 이라며 결국 수동 재시도로 로그인 성공).
+    # 이제는 '수동 재클릭'을 없앤다: 짧은 재시도를 여러 번 한 뒤에도 안 되면
+    # 더 긴 간격으로 계속 자동 재시도하며 사이트 회복을 스스로 기다린다.
+    # 오직 (a) 로그인 성공, (b) 사용자가 [정지]를 누름, (c) 전체 대기 예산 소진
+    # 셋 중 하나에서만 멈춘다.
+    LOGIN_ATTEMPTS = 6              # 짧은 백오프로 도는 초기 재시도 횟수
+    LOGIN_RETRY_BACKOFF = 4.0      # 초기 재시도 사이 기본 대기(초). 시도마다 늘린다.
+    LOGIN_LONG_RETRY_WAIT = 45.0   # 초기 재시도 소진 후, 긴 간격 자동 재시도 주기(초)
+    LOGIN_TOTAL_BUDGET = 1200.0    # 자동 재시도 총 예산(초, 기본 20분). 이후엔 안내하고 멈춤
 
     def login(self, naver_id, naver_pw):
         """이지론 -> 네이버 로그인 전체 플로우. 성공하면 True.
 
-        일시적 TimeoutException(페이지 지연/오류)은 삼켜서 몇 번 재시도한다.
-        재시도까지 다 소진하면 LoginTemporarilyUnavailable 을 던져 호출부가
-        raw 트레이스백 대신 차분한 안내를 하도록 한다.
+        일시적 TimeoutException(페이지 지연/오류)은 삼켜서 자동 재시도한다.
+        초기 짧은 재시도(LOGIN_ATTEMPTS)를 소진해도 포기하지 않고, 더 긴 간격으로
+        총 대기 예산(LOGIN_TOTAL_BUDGET)까지 계속 스스로 재시도한다. 그래서 사용자가
+        [시작]을 손으로 다시 누를 필요가 없다. 예산까지 소진하면 그때서야
+        LoginTemporarilyUnavailable 을 던져 차분한 안내를 하도록 한다.
         """
         if self.ezloan_logged_in():
             self.log("이미 로그인되어 있습니다.")
             return True
 
+        clock = self._time  # 테스트에서 가짜 시계로 교체 가능(기본은 time.time).
+        deadline = clock() + self.LOGIN_TOTAL_BUDGET
         last_err = None
-        for attempt in range(1, self.LOGIN_ATTEMPTS + 1):
+        attempt = 0
+        while clock() < deadline:
             if self.should_stop():
                 self.log("중지 요청으로 로그인 중단")
                 return False
+            attempt += 1
             try:
                 self._open_naver_from_ezloan()
                 self._force_korean()
                 self._fill_credentials(naver_id, naver_pw)
                 self._click_login()
                 return self._outcome_loop(naver_id, naver_pw)
-            except TimeoutException as e:
-                last_err = e
-                # 이미 이지론 세션이 서 있으면(폼 대기만 실패한 경우) 성공으로 본다.
-                if self._safe(self.ezloan_logged_in):
-                    self.log("네이버 로그인 폼 대기는 지연됐지만 이지론 세션이 확인됨 ✅")
-                    return True
-                if attempt >= self.LOGIN_ATTEMPTS:
-                    break
-                wait_s = self.LOGIN_RETRY_BACKOFF * attempt
-                self.log(
-                    f"로그인 페이지가 잠시 느립니다({attempt}/{self.LOGIN_ATTEMPTS}). "
-                    f"{int(wait_s)}초 후 자동으로 다시 시도합니다..."
-                )
-                self._sleep_interruptible(wait_s)
-                continue
-            except WebDriverException as e:
+            except (TimeoutException, WebDriverException) as e:
                 # 중지 요청으로 인한 중단은 그대로 실패 처리(재시도 무의미).
                 if self.should_stop():
                     self.log("중지 요청으로 로그인 중단")
                     return False
                 last_err = e
-                if attempt >= self.LOGIN_ATTEMPTS:
+                # 이미 이지론 세션이 서 있으면(폼 대기만 실패한 경우) 성공으로 본다.
+                if self._safe(self.ezloan_logged_in):
+                    self.log("네이버 로그인 폼 대기는 지연됐지만 이지론 세션이 확인됨 ✅")
+                    return True
+                # 초기엔 짧은 백오프, 그 뒤로는 긴 간격으로 '계속' 자동 재시도.
+                if attempt < self.LOGIN_ATTEMPTS:
+                    wait_s = self.LOGIN_RETRY_BACKOFF * attempt
+                    self.log(
+                        f"로그인 페이지가 잠시 느립니다({attempt}/{self.LOGIN_ATTEMPTS}). "
+                        f"{int(wait_s)}초 후 자동으로 다시 시도합니다..."
+                    )
+                else:
+                    wait_s = self.LOGIN_LONG_RETRY_WAIT
+                    remaining = int(max(0, deadline - clock()))
+                    self.log(
+                        "이지론/네이버가 잠시 지연되는 것 같습니다. 사이트가 회복될 때까지 "
+                        f"{int(wait_s)}초 간격으로 계속 자동 재시도합니다(남은 대기 약 {remaining//60}분). "
+                        "[시작]을 다시 누르실 필요는 없습니다."
+                    )
+                # 다음 재시도가 대기 예산을 넘기면 더 돌지 않는다.
+                if clock() + wait_s >= deadline:
                     break
-                wait_s = self.LOGIN_RETRY_BACKOFF * attempt
-                self.log(
-                    f"로그인 중 브라우저 오류가 잠시 발생했습니다({attempt}/{self.LOGIN_ATTEMPTS}). "
-                    f"{int(wait_s)}초 후 다시 시도합니다..."
-                )
                 self._sleep_interruptible(wait_s)
                 continue
 
         raise LoginTemporarilyUnavailable(str(last_err) if last_err else "로그인 페이지 지연")
+
+    def _time(self):
+        """login() 재시도 예산에 쓰는 시계. 테스트에서 가짜 시계로 교체 가능."""
+        return time.time()
 
     def _sleep_interruptible(self, seconds):
         """중지 요청이 오면 즉시 깨어나는 대기."""
@@ -171,10 +192,11 @@ class NaverLogin:
             self.log(f"네이버 로그인 버튼을 찾지 못했습니다({attempt}/4). 페이지를 다시 불러옵니다...")
             time.sleep(3)
         if btn is None:
+            # 여기서 던진 TimeoutException 은 상위 login() 자동 재시도 루프가 잡아
+            # 더 긴 간격으로 계속 스스로 다시 시도한다(사용자 [시작] 재클릭 불필요).
             raise TimeoutException(
                 "이지론 로그인 페이지가 정상적으로 열리지 않았습니다. "
-                "이지론(ezloan.io) 사이트가 일시적으로 오류/점검 중일 수 있습니다. "
-                "잠시 후 [시작]을 다시 눌러 주세요."
+                "이지론(ezloan.io) 사이트가 일시적으로 오류/점검 중일 수 있습니다."
             )
         btn.click()
         time.sleep(2.5)
@@ -199,18 +221,34 @@ class NaverLogin:
         """지금 이지론 페이지가 서버 오류 페이지(Whoops!/snag 류)인지 판정.
 
         Laravel/CI 기본 오류 페이지는 로그인 폼 대신 짧은 안내문만 보여 준다.
-        정상 로그인 페이지에는 항상 '네이버로 로그인' 관련 요소가 있으므로,
-        그게 없고 오류 문구가 보이면 사이트 일시 오류로 본다.
+        정상 로그인 페이지에는 항상 '네이버로 로그인' 버튼(.js-loginBtn[data-type=naver])이
+        있으므로, 그 버튼이 있으면 어떤 문구가 보이든 오류 페이지로 보지 않는다
+        (false-positive 방지). 버튼이 없을 때만 오류 문구로 판정한다.
+
+        주의(2026-07-17 실측): 정상 /m/login 의 rendered text 에는 error marker 가
+        하나도 없다(네이버 버튼 3개 존재). 예전 marker 목록의 맨숭한 "500" 은
+        "500만원" 같은 정상 문구에도 걸릴 수 있어(false-positive), 오류 맥락과
+        함께 나올 때만(server error / http 500 류) 오류로 본다.
         """
+        # 로그인 버튼이 실제로 있으면 정상 페이지다(문구 무관). 오탐 차단.
+        if self._safe(lambda: self.d.find_element(
+                By.CSS_SELECTOR, '.js-loginBtn[data-type="naver"]')) is not None:
+            return False
         try:
             body = (self._safe(lambda: self.d.find_element(By.TAG_NAME, "body").text) or "").lower()
         except WebDriverException:
             return False
         if not body:
             return False
-        markers = ("whoops", "hit a snag", "try again later", "잠시 후 다시",
-                   "500", "server error", "점검")
-        return any(m in body for m in markers)
+        # 명확한 오류 문구.
+        strong_markers = ("whoops", "hit a snag", "try again later",
+                          "server error", "점검 중", "서비스 점검", "일시적으로 중단")
+        if any(m in body for m in strong_markers):
+            return True
+        # 맨숭한 숫자 '500' 은 오류 맥락(error/server/http)과 함께일 때만 오류로 본다.
+        if "500" in body and any(k in body for k in ("error", "server", "http", "오류")):
+            return True
+        return False
 
     def _force_korean(self):
         """네이버 로그인 UI(헤더 + 보안문자)를 한국어로 강제."""
