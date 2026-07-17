@@ -9,7 +9,7 @@ import ezloan_bot as eb
 KST = timezone(timedelta(hours=9))
 
 assert config.RUN_WINDOW_ENABLED is False, "RUN_WINDOW_ENABLED must be False"
-assert config.APP_VERSION == "2.4.5", f"version bump missing: {config.APP_VERSION}"
+assert config.APP_VERSION == "2.4.6", f"version bump missing: {config.APP_VERSION}"
 
 # 1) in_run_window() 은 하루 24시간 어느 시각에도 True 여야 한다.
 bad = []

@@ -3,7 +3,7 @@
 
 import os
 
-APP_VERSION = "2.4.5"
+APP_VERSION = "2.4.6"
 CUSTOMER_ID = "5136338"
 
 # 이지론
@@ -17,7 +17,11 @@ RQ_URL = f"{BASE_URL}/rq"           # 실시간 대출 문의 목록 (검증: 20
 NAVER_LOGIN_URL = "https://nid.naver.com/nidlogin.login?locale=ko_KR"
 
 # 등록 루프 파라미터
-POLL_SECONDS = 1.5          # 목록 폴링 주기
+# 새 글 상단(1등) 경쟁: 폴링 주기가 곧 '새 글 감지 지연'의 상한이다. v2.4.6 에서 사이클당
+# 목록 요청을 2회->1회로 줄이고 open 글의 post_exists(288KB) 선차단을 없애 사이클을 크게
+# 가볍게 했으므로, 폴링 주기를 1.5s->0.8s 로 좁혀도 사이트 부담은 예전보다 낮다. 이렇게
+# 감지 지연을 절반으로 줄여 경쟁사보다 먼저 rq_addbanner 를 쏜다.
+POLL_SECONDS = 0.8          # 목록 폴링 주기(새 글 감지 지연 상한)
 LOOKAHEAD = 6               # 프런티어 앞으로 미리 확인할 순번 수 (0=끄기)
 MAX_POSTS = 20             # 목록에서 확인할 최대 글 수
 # 새 글마다 연속 'no permission' 거부가 이 횟수 이상 쌓였을 때만 계정 힌트를 1회 알린다.

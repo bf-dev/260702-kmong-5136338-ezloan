@@ -219,26 +219,35 @@ def post_exists(s, pid):
 
 
 def probe_state(s, pid):
-    """open / ing / absent / future / blocked / no_session / error"""
+    """(state, data) 반환. state: open / ing / absent / future / blocked / no_session / error
+
+    핫패스 속도(새 글 1등 경쟁): result:true('open' 후보)일 때는 여기서 무거운 post_exists
+    (/rq/{id} ~288KB 전체 페이지)를 부르지 않는다. 예전엔 open 판정 전에 post_exists 를
+    반드시 통과시켜 유령(미래) 번호가 프런티어를 폭주시키는 것을 막았는데, 그 288KB 왕복이
+    '경쟁사보다 먼저 rq_addbanner 를 쏴야 하는' 바로 그 글의 등록을 늦춰 2등으로 밀리는
+    원인이 됐다(실측 2026-07-17: 새 글 등록 핫패스가 v2.4.1 133ms -> v2.4.5 288ms 로 2배↑).
+    이제 open 후보는 존재 확인 없이 즉시 등록을 시도한다. 유령(미래) 번호면 register() 가
+    rq_addbanner '404 error' + post_exists=False 로 post_absent 를 돌려주고, 상위 루프는
+    그 결과를 보고 프런티어를 전진시키지 않는다 -> 폭주 방지는 그대로 유지되면서, 실제 글에는
+    무거운 존재 확인을 아예 하지 않는다(post_exists 는 이제 거부/404 가 났을 때만 지연 호출).
+    """
     try:
         code, data = _check(s, pid)
     except Exception:
-        return "error"
+        return "error", None
     if code != 200:
-        return "error"
+        return "error", None
     if data.get("result") is True:
-        # check 통과(=계정 유료광고/잔여 정상)라도, 글이 실제로 존재해야 add 가 성공한다.
-        # 미래(미존재) 번호면 rq_addbanner 가 '404 error' 를 주므로 여기서 걸러 낸다.
-        return "open" if post_exists(s, pid) else "future"
+        return "open", (code, data)
     msg = (data.get("msg") or "").strip().lower()
     # 진짜 세션 소실 신호(로그아웃/미인증)일 때만 no_session. '404 error'/'no permission' 은
     # 세션 사망이 아니라 계정상태상 지금 등록 불가일 뿐이므로 아래 blocked 로 떨어뜨린다.
     if _is_session_lost_msg(msg):
-        return "no_session"
+        return "no_session", None
     if "존재하지" in msg or "삭제" in msg:
-        return "absent"
+        return "absent", None
     if msg == "ing":
-        return "ing"
+        return "ing", None
     # result:false + (세션소실/삭제/ing 아님) = 계정상태상 지금 등록 불가(예: 'no permission',
     # '404 error'). 여기서 반드시 글 실존을 확인한다. rq_addbanner_check 는 '글 존재'를 검사
     # 하지 않고 계정 상태만 본다(미래 번호에도 동일 응답). 따라서 계정이 'no permission' 상태로
@@ -248,24 +257,37 @@ def probe_state(s, pid):
     # 2026-07-13: 계정 no_permission 중 프런티어 30031->31213, 미존재 번호로 +6/사이클 runaway).
     # 그러면 나중에 실제 새 글이 생겨도 이미 프런티어보다 아래라 look-ahead 가 못 잡아 즉시-등록
     # (상위 노출)을 놓친다. 실존이 확인된 글만 blocked(전진 가능), 미존재면 future(전진 금지).
-    return "blocked" if post_exists(s, pid) else "future"
+    return ("blocked", None) if post_exists(s, pid) else ("future", None)
 
 
 def lookahead_ids(s, frontier, window):
     """프런티어 앞쪽을 미리 찔러 '실제로 존재하며 등록 가능한' 새 글 번호를 찾는다.
 
-    반환: (등록 대상 id 리스트, safe_frontier).
-    safe_frontier = '아직 안 생긴(존재하지 않는) 첫 번호'. 상위 루프는 프런티어를 이 값
+    반환: (등록 후보 리스트, safe_frontier).
+      - 등록 후보: (pid, precheck) 튜플. precheck 는 그 글의 rq_addbanner_check 결과
+        (code, data) 이며 register() 가 재검사 없이 그대로 재사용한다(핫패스 왕복 절감).
+    safe_frontier = '전진해도 안전(존재가 확정)한 다음 번호'. 상위 루프는 프런티어를 이 값
     이상으로 올리면 안 된다. 그렇지 않으면 유령(미래) 번호를 지나쳐 프런티어가 폭주하고,
     나중에 그 번호로 실제 글이 생겨도 이미 프런티어보다 아래라 영원히 건너뛴다(핵심 버그).
+
+    핵심(v2.4.6): 'open' 후보는 이제 존재 확인(post_exists) 없이 잡으므로 '실존 확정'이
+    아니다. 따라서 open 을 만나면 safe_frontier 를 그 번호 너머로 밀지 않고 멈춘다. 실존
+    확정과 프런티어 전진은 상위 루프가 register() 결과(post_absent 면 미전진, 그 외 실존)로
+    처리한다 -> 프런티어 폭주 방지는 그대로 유지되면서, 실제 새 글 등록은 즉시 이뤄진다.
     """
     found, pid, end, absents = [], frontier, frontier + window, 0
     safe_frontier = frontier
     while pid < end:
-        st = probe_state(s, str(pid))
-        if st in ("open", "ing"):
-            found.append(str(pid)); absents = 0
-            safe_frontier = pid + 1  # 존재가 확인된 글까지만 프런티어를 전진시킨다.
+        st, precheck = probe_state(s, str(pid))
+        if st == "open":
+            # 존재 미확정 후보. 즉시 등록 시도 대상으로 넘기고, 여기서 멈춘다(safe_frontier
+            # 를 밀지 않음 -> 유령 번호가 open 으로 잡혀도 프런티어가 넘어가지 않는다).
+            found.append((str(pid), precheck))
+            break
+        elif st == "ing":
+            # 이미 내 배너가 붙은 실존 글. 존재 확정이므로 전진해도 안전.
+            found.append((str(pid), precheck)); absents = 0
+            safe_frontier = pid + 1
         elif st == "blocked":
             absents = 0
             safe_frontier = pid + 1  # 존재하나 지금은 등록 불가(권한/마감 등) - 지나가도 됨.
@@ -284,29 +306,39 @@ def lookahead_ids(s, frontier, window):
         else:
             break
         pid += 1
-    found.sort(key=int, reverse=True)
+    found.sort(key=lambda t: int(t[0]), reverse=True)
     return found, safe_frontier
 
+
+# 실측(2026-07-17): /rq/{pid} 의 실제 '배너 목록'은 <a href="/l/{광고주id}" class="item ...">
+# 항목들이며(각 항목에 <div class="name">상호</div>), 이 순서가 곧 배너 노출 순위다(1번째=1등).
+# 순위는 등록 '시각' 순(먼저 rq_addbanner 를 쏜 광고주가 위)이다(광고주 id 순 아님 - 실측 확인).
+# 예전 company_rank 는 페이지 전체 <li>(네비/푸터 포함)를 세어 상호가 늘 ~147번째로 나와
+# 실제 배너 순위(1~9위대)와 무관한 값을 로그에 남겼다. 이제 '진짜 배너 항목'만 세어 실제
+# 상단 순위(1등/2등)를 보고한다 -> 로그의 rank 가 곧 고객이 사이트에서 보는 그 순위다.
+_BANNER_ITEM_RE = re.compile(
+    r'<a href="/l/\d+" class="item[^"]*"[^>]*>\s*<div class="name">([^<]*)</div>')
 
 def company_rank(s, pid, company=config.COMPANY_NAME):
     try:
         r = s.get(f"{config.BASE_URL}/rq/{pid}", timeout=10)
     except Exception:
         return 0
-    blocks = re.split(r"<li[\s>]", r.text)[1:]
-    idx = 0
-    for block in blocks:
-        plain = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", block)).strip()
-        if not plain or "배너 등록을 눌러 주세요" in plain:
-            continue
-        idx += 1
-        if company in plain:
+    names = [n.strip() for n in _BANNER_ITEM_RE.findall(r.text)]
+    for idx, name in enumerate(names, 1):
+        if company in name:
             return idx
     return 0
 
 
-def register(s, pid, company=config.COMPANY_NAME):
-    code, data = _check(s, pid)
+def register(s, pid, company=config.COMPANY_NAME, precheck=None):
+    # precheck: (code, data) 를 lookahead 의 probe_state 에서 이미 받아 왔으면 재사용한다.
+    # 새 글 경쟁에서 상단(1등)을 잡으려면 rq_addbanner 를 최대한 빨리 쏴야 하므로,
+    # 같은 rq_addbanner_check 를 두 번 치지 않는다(핫패스 왕복 1회 절감).
+    if precheck is not None:
+        code, data = precheck
+    else:
+        code, data = _check(s, pid)
     if code != 200:
         return {"ok": False, "rank": None, "note": "check_http_error",
                 "status": code, "msg": None}
@@ -686,8 +718,11 @@ class Registrar:
                 # 여기서 실제 목록 기준으로 되돌린다. 목록의 글은 이미 seen 에 흡수되므로 되돌려도
                 # 재-add 가 나지 않고, look-ahead 가 다시 '진짜 새 글'을 즉시 잡을 수 있게 된다.
                 # (되돌리는 하한은 실제 최신글 바로 다음 번호. 그보다 낮추지 않아 옛 글 재처리 없음.)
-                probe_ids = list_post_ids(self.s)
-                real_max = max((int(x) for x in probe_ids if str(x).isdigit()), default=0)
+                # 목록은 사이클당 '한 번만' 가져온다(각 ~309KB). 예전엔 프런티어 재동기화용과
+                # 안전망용으로 목록을 두 번 받았는데(v2.4.3~), 그 여분의 왕복이 사이클을 늘려
+                # 새 글 감지·등록을 늦췄다. 같은 목록을 재동기화·안전망에 함께 쓴다.
+                ids = list_post_ids(self.s)
+                real_max = max((int(x) for x in ids if str(x).isdigit()), default=0)
                 if real_max:
                     sane_frontier = real_max + 1
                     # 정상 앞섬(창 크기)보다 크게 벗어났을 때만 되돌린다(정상 미세 앞섬은 유지).
@@ -700,22 +735,27 @@ class Registrar:
                             force=True,
                         )
                         frontier = sane_frontier
-                # 1) look-ahead
+                # 1) look-ahead: 새 글을 가장 빨리 잡아 즉시 등록(상단 1등 경쟁의 핵심 경로).
                 if config.LOOKAHEAD > 0:
                     ahead, safe_frontier = lookahead_ids(self.s, frontier, config.LOOKAHEAD)
                     # 프런티어는 '존재가 확인된 번호'까지만 전진시킨다. lookahead 가 돌려준
-                    # safe_frontier 는 아직 안 생긴 첫 번호이므로, 이 값을 넘겨 올리면
+                    # safe_frontier 는 아직 안 생긴/미확정 첫 번호이므로, 이 값을 넘겨 올리면
                     # 유령(미래) 번호를 지나쳐 나중에 실제 글이 생겨도 못 잡는다.
                     if safe_frontier > frontier:
                         frontier = safe_frontier
-                    for pid in ahead:
+                    for pid, precheck in ahead:
                         if pid in self.seen:
                             continue
-                        self._handle(pid)
+                        # register() 가 precheck(rq_addbanner_check 결과)를 재사용하므로 이 글엔
+                        # rq_addbanner 만 한 번 더 쏘면 된다 -> 경쟁사보다 먼저 상단을 잡는다.
+                        registered_ok = self._handle(pid, precheck=precheck)
+                        # 실존이 확정된(등록 성공/이미등록/거부-실재) 글이면 프런티어를 그 너머로
+                        # 전진시킨다. post_absent(유령/미래 번호)면 전진하지 않아 폭주를 막는다.
+                        if registered_ok and pid.isdigit() and int(pid) >= frontier:
+                            frontier = int(pid) + 1
                         if self.should_stop():
                             break
-                # 2) listing safety net
-                ids = list_post_ids(self.s)
+                # 2) listing safety net (위에서 이미 받은 목록 재사용)
                 new = [i for i in ids if i not in self.seen]
                 # 사이클 진단: 목록 수 / 새 글 수 / 세션-없음 연속 카운트 (10초 디바운스)
                 self.remote(
@@ -812,8 +852,14 @@ class Registrar:
             self._wait(config.POLL_SECONDS)
         self.remote("run_stopped", "폴링 루프 중지", force=True)
 
-    def _handle(self, pid):
-        result = register(self.s, pid)
+    def _handle(self, pid, precheck=None):
+        """이 글을 등록 시도한다. 반환값: 이 글이 '실존이 확정'됐는지(bool).
+
+        상위 lookahead 루프는 이 반환값으로 프런티어 전진을 결정한다. post_absent(아직 안
+        생긴 미래/유령 번호)만 False 이고, 그 외(등록 성공/이미 등록/실재하나 거부 등)는 전부
+        실존이 확정된 것이므로 True. 안전망(목록) 경로는 반환값을 쓰지 않는다(무해).
+        """
+        result = register(self.s, pid, precheck=precheck)
         note = result.get("note", "")
         status = result.get("status")
         msg = result.get("msg")
@@ -920,6 +966,21 @@ class Registrar:
         else:
             # 정상적으로 '등록 불가'인 글들(예: max/no ads 등)은 디바운스 로그.
             self.remote("register_skip", f"post={pid} status={status} msg={msg} note={note}")
+
+        # 실존 확정 여부(상위 lookahead 의 프런티어 전진 판단용).
+        #  - post_absent: 아직 안 생긴 미래/유령 번호 -> 실존 아님(전진 금지, 폭주 방지).
+        #  - check_http_error / add_error / add_failed / session_lost: 존재를 판정 못 했으니
+        #    보수적으로 '미확정'(False) -> 프런티어 전진하지 않고 다음 사이클에 다시 시도한다
+        #    (실제 새 글을 성급히 지나쳐 놓치지 않도록).
+        #  - 그 외(등록 성공/이미 등록/no_permission/add_refused): 글이 실재함 -> 전진 가능.
+        if note == "post_absent":
+            return False
+        if result.get("ok"):
+            return True
+        if note in ("no_permission", "add_refused", "already_registered_api",
+                    "slots_full", "no_banner_amount", "no_ads", "no_payed_ads"):
+            return True
+        return False
 
     def _wait(self, seconds):
         end = time.time() + seconds

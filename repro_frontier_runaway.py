@@ -94,10 +94,16 @@ def build_registrar():
 
 
 def one_cycle(r, frontier):
-    """run() 루프의 한 사이클(프런티어 보정 + look-ahead + 목록 안전망)을 그대로 실행."""
-    # 0) 프런티어 자가 보정
-    probe_ids = eb.list_post_ids(r.s)
-    real_max = max((int(x) for x in probe_ids if str(x).isdigit()), default=0)
+    """run() 루프의 한 사이클(v2.4.6 구조: 목록 1회 + look-ahead + 목록 안전망)을 그대로 실행.
+
+    v2.4.6 변경 반영:
+      - 목록은 사이클당 1회만 받아 프런티어 재동기화·안전망에 함께 쓴다.
+      - lookahead 는 (pid, precheck) 튜플을 돌려주고, open 후보는 존재 미확정이라 safe_frontier
+        를 넘기지 않는다. 프런티어 전진은 _handle 반환값(실존 확정 여부)으로 결정한다.
+    """
+    # 목록 1회
+    ids = eb.list_post_ids(r.s)
+    real_max = max((int(x) for x in ids if str(x).isdigit()), default=0)
     if real_max:
         sane = real_max + 1
         if frontier > sane + config.LOOKAHEAD:
@@ -106,12 +112,13 @@ def one_cycle(r, frontier):
     ahead, safe_frontier = eb.lookahead_ids(r.s, frontier, config.LOOKAHEAD)
     if safe_frontier > frontier:
         frontier = safe_frontier
-    for pid in ahead:
+    for pid, precheck in ahead:
         if pid in r.seen:
             continue
-        r._handle(pid)
-    # 2) 목록 안전망
-    ids = eb.list_post_ids(r.s)
+        exists = r._handle(pid, precheck=precheck)
+        if exists and pid.isdigit() and int(pid) >= frontier:
+            frontier = int(pid) + 1
+    # 2) 목록 안전망(위에서 받은 목록 재사용)
     new = [i for i in ids if i not in r.seen]
     for pid in sorted(new, key=int, reverse=True):
         if pid.isdigit() and int(pid) >= frontier:

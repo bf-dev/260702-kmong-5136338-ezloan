@@ -1,0 +1,11 @@
+{
+  "project": "260702-kmong-5136338-ezloan",
+  "customerId": "d3b89a47-f8bc-45d0-b6fa-03e50f1dfded",
+  "partnerId": 5136338,
+  "customerName": "울고싶은정원2674",
+  "kmongOrderIds": [],
+  "status": "active",
+  "createdAt": "2026-07-02",
+  "deploy": {},
+  "notes": "kmongOrderIds left empty: partner 5136338 owns 4 projects and 4 order(s); the split is not derivable from the data."
+}

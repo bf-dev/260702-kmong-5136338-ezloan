@@ -28,6 +28,7 @@ jobs:
         run: |
           python verify_247.py
           python repro_frontier_runaway.py
+          python verify_register_latency.py
 
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
