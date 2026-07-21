@@ -349,12 +349,27 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
         return {"ok": msg == "ing", "rank": None, "note": note,
                 "status": code, "msg": raw_msg,
                 "session_lost": _is_session_lost_msg(msg)}
+    # 여기까지 왔으면 rq_addbanner_check 가 result:true 였다는 뜻(= 세션 유효 + 계정
+    # 유료광고/배너 잔여 정상). 그 응답의 'amount'(남은 실시간 배너 잔여 개수)를 꺼내
+    # 결과에 실어 보낸다. 이 고객의 '배너가 안 올라간다' 진단에서 결정적 신호다:
+    #   - 등록이 거부(no_permission)되는데 amount 가 0/저잔여면 => 계정 배너 잔여 소진(고객 조치).
+    #   - amount 가 넉넉한데도 거부면 => 개별-글 사유(이미 등록/마감 등, 정상 스킵).
+    # (근거: 실측 2026-07-10 check success 응답에 amount:113. rq_addbanner_check 는 계정의
+    #  유료광고/배너 잔여만 검사한다. 이 값을 로그로 남기면 다음 진단이 한눈에 끝난다.)
+    check_amount = None
+    try:
+        av = data.get("amount", data.get("data", {}).get("amount") if isinstance(data.get("data"), dict) else None)
+        if av is not None:
+            check_amount = int(av) if str(av).strip().lstrip("-").isdigit() else av
+    except Exception:
+        check_amount = None
     try:
         _sync_csrf_header(s)
         r = s.get(f"{config.BASE_URL}/api/rq_addbanner/{pid}", timeout=12)
         add = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
     except Exception as e:
-        return {"ok": False, "rank": None, "note": f"add_error:{e}", "status": None, "msg": None}
+        return {"ok": False, "rank": None, "note": f"add_error:{e}", "status": None,
+                "msg": None, "amount": check_amount}
     add_msg = (add.get("msg") or "").strip()
     if r.status_code != 200 or add.get("result") is not True:
         # 여기까지 왔다는 건 rq_addbanner_check 가 result:true 였다는 뜻이다
@@ -374,11 +389,12 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
             return {"ok": False, "rank": None,
                     "note": "add_refused" if exists else "post_absent",
                     "status": r.status_code, "msg": add_msg,
-                    "session_lost": False,
+                    "session_lost": False, "amount": check_amount,
                     "body": (r.text or "")[:300]}
         return {"ok": False, "rank": None, "note": "add_failed",
                 "status": r.status_code, "msg": add_msg,
                 "session_lost": _is_session_lost_msg(add_msg),
+                "amount": check_amount,
                 "body": (r.text or "")[:300]}
     rank = company_rank(s, pid, company)
     for _ in range(3):
@@ -387,7 +403,7 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
         time.sleep(0.15)
         rank = company_rank(s, pid, company)
     return {"ok": True, "rank": rank, "note": "registered" if rank else "registered_not_verified",
-            "status": 200, "msg": add_msg or "success"}
+            "status": 200, "msg": add_msg or "success", "amount": check_amount}
 
 
 class Registrar:
@@ -411,6 +427,10 @@ class Registrar:
         self._session_lost_streak = 0   # 연속 세션-없음 신호 카운트
         self._cycle = 0
         self._registered_total = 0
+        # 마지막으로 rq_addbanner_check 가 통과했을 때의 남은 배너 잔여 개수(amount).
+        # 사이클 요약에 실어 로그로 남긴다 -> '배너 안 올라감' 진단에서 계정 배너 잔여
+        # 소진 여부를 한눈에 확인(등록 거부 + 잔여 0 = 고객이 배너 상품을 충전/연장해야 함).
+        self._last_amount = None
         self._last_session_save = 0.0   # 갱신된 쿠키를 디스크에 다시 저장한 시각
         # '새로 생긴(프런티어) 글'에서 add 가 거부된 연속 횟수. 이미 등록한 옛 글의 거부
         # (add_refused, 재시작 되감김)와 구분한다. 새 글에서까지 계속 거부되면 세션 자체가
@@ -758,11 +778,13 @@ class Registrar:
                 # 2) listing safety net (위에서 이미 받은 목록 재사용)
                 new = [i for i in ids if i not in self.seen]
                 # 사이클 진단: 목록 수 / 새 글 수 / 세션-없음 연속 카운트 (10초 디바운스)
+                amt = "미확인" if self._last_amount is None else self._last_amount
                 self.remote(
                     "cycle",
                     f"#{self._cycle} 목록={len(ids)} 새글={len(new)} "
                     f"누적확인={len(self.seen)} 등록={self._registered_total} "
-                    f"세션없음연속={self._session_lost_streak} frontier={frontier}",
+                    f"세션없음연속={self._session_lost_streak} frontier={frontier} "
+                    f"배너잔여={amt}",
                 )
                 for pid in sorted(new, key=int, reverse=True):
                     if pid.isdigit() and int(pid) >= frontier:
@@ -864,6 +886,10 @@ class Registrar:
         status = result.get("status")
         msg = result.get("msg")
         body = result.get("body")
+        # rq_addbanner_check 가 통과했을 때만 amount 가 실린다. 마지막 값으로 기억해
+        # 사이클 요약에 남긴다(계정 배너 잔여 진단용). None 이면 이번엔 못 읽은 것.
+        if result.get("amount") is not None:
+            self._last_amount = result.get("amount")
 
         # 세션-없음 신호 추적: 연속 카운트로 '조용히 멈춤'을 불가능하게 만든다.
         if result.get("session_lost"):
@@ -914,11 +940,12 @@ class Registrar:
             # (=연속 임계 초과) 딱 한 번 띄운다(실제 증거가 있을 때만).
             self._no_perm_streak += 1
             self.log("이미 처리했거나 지금 등록 대상이 아닌 건이라 건너뜁니다. (로그인·자동등록은 정상 동작 중)")
+            amt = "미확인" if self._last_amount is None else self._last_amount
             self.remote(
                 "register_no_permission",
                 f"post={pid} status={status} msg={msg} note={note} "
                 f"(로그인 유효, 이 글은 현재 등록 대상 아님 - 개별-글 스킵, "
-                f"새글연속거부={self._no_perm_streak})",
+                f"새글연속거부={self._no_perm_streak} 마지막배너잔여={amt})",
                 # 개별 스킵은 조용히(디바운스), 연속 거부가 쌓일 때만 크게 알린다.
                 force=(self._no_perm_streak >= config.NO_PERM_WARN_STREAK),
             )
@@ -935,8 +962,9 @@ class Registrar:
                 self.remote(
                     "no_permission_persistent",
                     f"새 글에서 연속 {self._no_perm_streak}회 'no permission' 거부 "
-                    "(logged_in=True). 개별-글이 아니라 계정 측 등록 자격 문제 가능성 - "
-                    "계정 힌트 1회 알림.",
+                    f"(logged_in=True, 마지막배너잔여={amt}). 개별-글이 아니라 계정 측 "
+                    "등록 자격 문제 가능성 - 계정 힌트 1회 알림. "
+                    "(마지막배너잔여=0 이면 실시간 배너 잔여 소진 = 고객이 충전/연장 필요.)",
                     force=True,
                 )
         elif note == "post_absent":

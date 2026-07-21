@@ -9,7 +9,28 @@ import ezloan_bot as eb
 KST = timezone(timedelta(hours=9))
 
 assert config.RUN_WINDOW_ENABLED is False, "RUN_WINDOW_ENABLED must be False"
-assert config.APP_VERSION == "2.4.6", f"version bump missing: {config.APP_VERSION}"
+assert config.APP_VERSION == "2.4.7", f"version bump missing: {config.APP_VERSION}"
+
+# v2.4.7: register() 가 rq_addbanner_check 의 amount(배너 잔여)를 결과에 실어야 한다.
+class _FakeResp:
+    def __init__(self, js, status=200):
+        self._js = js; self.status_code = status
+        self.headers = {"content-type": "application/json"}; self.text = ""
+    def json(self): return self._js
+class _FakeSess:
+    def __init__(self, add_js): self._add_js = add_js; self.headers = {}; self.cookies = {}
+    def get(self, url, **k):
+        if "rq_addbanner_check" in url:
+            return _FakeResp({"result": True, "amount": 113})
+        if "rq_addbanner/" in url:
+            return _FakeResp(self._add_js)
+        return _FakeResp({}, 200)
+eb._sync_csrf_header = lambda s: None
+eb.post_exists = lambda s, pid: True
+_r = eb.register(_FakeSess({"result": False, "msg": "no permission"}), "30511")
+assert _r.get("amount") == 113, f"amount not threaded on refusal: {_r}"
+assert _r.get("note") == "add_refused", _r
+print("[OK] register() carries 배너잔여(amount)=113 on no_permission refusal")
 
 # 1) in_run_window() 은 하루 24시간 어느 시각에도 True 여야 한다.
 bad = []
