@@ -56,3 +56,39 @@ practice we should be at/near 100% again after this speed fix.
   logged_in()==False is the ONLY session-death authority. See memory ezloan-registration-error-semantics.
 - Never overwrite an already-served exe filename on the static host (Cloudflare edge cache serves
   stale bytes -> restart loop). Versioned names only for anything auto-update might fetch.
+
+## v2.4.7 (2026-07-21) — log 배너잔여(amount) to answer "배너가 안 올라감" in one glance
+Customer report: "프로그램이 배너가 자꾸 안올라가더라구요" + "재시작하면 한개 올라가더니 그 담부턴 또 안됨".
+LIVE diagnosis (KR egress unicorn@external-8, do NOT log into their Naver — locks the account):
+- App is HEALTHY and CAUGHT UP. Live ezloan latest /rq post id == app frontier (30511, then 30512
+  as a new post appeared during the check and the app detected+advanced instantly). NOT frontier-stuck,
+  NOT a runaway, session healthy (11 cookies incl ezloan_sess, login_success). Frontier advanced
+  30503->30512 over the day, tracking new posts in real time. So (a) stuck / (b) app-bug are RULED OUT.
+- Real cause: ezloan REFUSES rq_addbanner with "no permission" on ~most new posts. Live: advertiser 585
+  (더원대부) present on only 4 of 22 recent posts (30490,91,92,08), ABSENT on the 3 newest (30509/10/11).
+  Slots are NOT full (14-24 banners/post, room remains) so it's a refusal, not a race loss.
+  Log: 새글연속거부 climbed to 14 on 30503-07, one success 30508, then 1-2 on 30509-10. Sporadic success.
+- Per the source (probe_state/register comments, memory ezloan-registration-error-semantics): "no
+  permission" reflects the ACCOUNT's paid-ad/실시간 배너 잔여 state (rq_addbanner_check checks account
+  entitlement, NOT post existence; the SAME cookie flips success->no_permission as credits deplete).
+  The behavioral signature (refused on most/newest posts, occasional success, healthy session) points
+  to the real-time banner credits being LOW / intermittently exhausted. Their paid ad was extended to
+  D-35 on 2026-07-10; ~11 days on, credits may be draining. BUT: v2.4.4 does NOT log the check 'amount'
+  (배너 잔여 개수), so the exact balance was not observable — that is why this kept getting re-diagnosed.
+- The "재시작하면 한개 올라감 then 안됨" pattern is explained: each restart resets _no_perm_warned/streak;
+  after restart the first eligible post registers (streak 0), then refusals resume. It is NOT the loop
+  stopping after one — frontier keeps advancing; ezloan just keeps refusing.
+
+FIX (v2.4.7): thread rq_addbanner_check's `amount` (remaining 실시간 배너 잔여) into the register result
+and surface it on EVERY cycle summary (배너잔여=N) and every register_no_permission / no_permission_persistent
+line (마지막배너잔여=N). No behavior change to the register/frontier loop. Now the very next run of the
+customer's app answers definitively: no_permission + 배너잔여=0 => credits exhausted, customer must
+renew/충전 the 실시간 배너 상품 (account-side, not our bug); no_permission + healthy 배너잔여 => routine
+per-post skip. CI: verify_247.py asserts amount threads through even on a no_permission refusal.
+
+OPEN ITEM for next turn: once the customer runs v2.4.7 (or if we can get an authed check), read
+배너잔여 from the log. If 0 -> tell customer to recharge/extend the 실시간 배너 상품 on ezloan (that is
+the confirmed customer action). Until then the honest line to the customer: app + login are working
+and detecting every new post instantly; ezloan is refusing registration ("등록 대상 아님") on most posts,
+which is an account/광고상품 잔여 signal, and v2.4.7 will show the exact remaining count next run.
+DO NOT flatly assert "your account lapsed" without the 배너잔여 number (that misdiagnosis burned trust twice).
