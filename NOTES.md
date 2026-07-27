@@ -250,3 +250,75 @@ failed or your spending limit needs to be increased". WORKAROUND: `gh repo edit 
 that here (repo has no secrets committed - just endpoint URLs); build immediately succeeded after. If
 a future build on this repo fails the same way, re-check `gh repo view ... --json visibility` is still
 `PUBLIC` first before assuming a real regression.
+
+---
+
+## 2026-07-27 — v2.5.1: REAL REGRESSION in the paid v2.5.0 speed upgrade, found+fixed+shipped same day
+
+Customer reported same-day: "프로그램 바꾸고 난 뒤로 한번씩 안올라가네요 ㅠ" with a screenshot of
+ezloan.io/rq/30820 (a "3분전" post) missing 585's banner. Root-caused via artifacts-check 5136338
+(NOT just the delta file the customer-agent had - use the fuller history, the delta only started
+mid-incident):
+
+  02:43:18 [registered] post=30819 rank=1 msg=success
+  02:43:19 [register_post_absent] post=30820 status=200 msg=404 error note=post_absent
+  (13 minutes of [cycle] rows, frontier pinned at 30820, zero register attempts logged for it)
+  02:56:25 frontier silently advances 30820->30821 with NO register call and NO count increment
+
+DEFINITIVE ROOT CAUSE (real code regression, NOT the ezloan account-limit pattern - ruled out
+because 배너잔여 stayed a healthy 186-187 the whole time and this was a single-post miss, not the
+"refused on every new post" signature of ezloan-account-daily-registration-limit.md):
+
+v2.4.6's speed optimization made the lookahead "open" branch fire rq_addbanner immediately with NO
+post_exists() pre-check (that's the entire point of the speed fix - see ezloan-banner-rank-semantics
+memory). In production this hits a real race: ezloan allocates the next post ID a fraction of a
+second before the page content is servable. rq_addbanner_check doesn't verify existence (account-
+level check only), so it says "open"; the WRITE then correctly fails "404 error", and register()
+classifies it post_absent (post_exists() confirms the page isn't live yet). THE BUG: post_absent was
+in NON_RETRYABLE, so `_handle()` added that pid to `self.seen` PERMANENTLY on the very first miss.
+The post went live moments later (confirmed by the customer's own screenshot minutes after), but the
+bot never tried again: lookahead keeps re-probing the same frontier pid every cycle (probe_state
+doesn't consult `seen`) and gets "open" again and again, but the outer loop's `if pid in seen:
+continue` silently skips calling register() - so nothing gets logged for 13 minutes, exactly matching
+the customer's silent miss. This is a genuine regression introduced by the paid v2.4.6 speed change,
+shipped in v2.5.0 the same day the customer paid 50,000원 for reliable fast registration - the direct
+opposite of what they paid for.
+
+FIX (v2.5.1, ezloan_bot.py): removed `post_absent` from NON_RETRYABLE. It no longer marks the pid
+`seen`; the frontier stays pinned on it (unchanged safety behavior) and the NEXT cycle re-probes and
+re-attempts registration automatically once the real page is live. Added a bounded escape hatch
+(`config.POST_ABSENT_GIVEUP_STREAK = 500`, ~7min at 0.8s poll) so a genuinely-nonexistent id doesn't
+stall the frontier forever - after that many consecutive post_absent hits on the SAME pid it gives up
+(marks seen, frontier advances, loud `register_post_absent_giveup` log).
+
+REPRO: repro_post_absent_race.py drives the real Registrar/register()/lookahead_ids code (not a
+description) - simulates a post that returns post_absent for 2 cycles then goes live; FAILS against
+the pre-fix NON_RETRYABLE set (pid never registers even after going live) and PASSES after the fix.
+Wired into CI as its own step.
+
+SEPARATE BUG FOUND WHILE RE-VERIFYING "no regression" (worth knowing for every future build on this
+repo): windows-latest's default shell (pwsh) does NOT fail a multi-line `run: |` block when an
+earlier command exits non-zero - it just runs the next line, and the step's pass/fail is whatever the
+LAST command returned. verify_247.py had a stale `assert config.APP_VERSION == "2.4.7"` left over
+from before the 2.5.0 version bump; it was ACTUALLY CRASHING on every v2.5.0 CI run, but the step
+showed green because `repro_frontier_runaway.py` (the next line in the same block) exited 0. So the
+NOTES.md claim under the v2.5.0 section that "all 5 CI verify scripts... PASSED" was not true for
+verify_247.py - it silently didn't run to completion. Fixed both problems: dropped the stale version
+pin from verify_247.py (it tests 24/7 gating + amount threading, not the version string), and split
+`.github/workflows/build.yml`'s combined verify step into one step per script so a future assertion
+failure actually fails the job. Any repo with a similar multi-command `run: |` block on a Windows
+runner should be treated as suspect until split the same way.
+
+DELIVERY: built via GitHub Actions (run 30233918008, all 9 verify/build steps now genuinely
+independent and green). Downloaded + verified `PE32+ executable (GUI) x86-64`, 33,273,786 bytes.
+Hosted at BOTH `ezloan-desktop-2.5.1.exe` and the canonical version-free
+`ezloan-desktop-update.exe` (both curl -I -> HTTP 200, content-length 33273786, cf-cache-status
+EXPIRED/MISS confirming fresh bytes, not stale cache). AUTO_UPDATE_ENABLED stays False - this is
+still a manual delivery, customer must download+run the new exe. bridge.py source auto-becomes
+`ezloan-desktop-v2.5.1` once they run it (derives from config.APP_VERSION, unchanged).
+
+Honest line for the customer: this WAS our bug, introduced by the very same speed upgrade they paid
+for, and it's now fixed and verified against a reproduction of the exact failure they hit. Consider
+whether any goodwill gesture is warranted (owner's call) given this was a same-day regression on a
+paid feature - flagging per owner-monetize-improvements-not-free.md's spirit that pricing/goodwill
+decisions here are the owner's, not mine to decide unilaterally.
