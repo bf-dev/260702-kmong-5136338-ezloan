@@ -9,7 +9,11 @@ import ezloan_bot as eb
 KST = timezone(timedelta(hours=9))
 
 assert config.RUN_WINDOW_ENABLED is False, "RUN_WINDOW_ENABLED must be False"
-assert config.APP_VERSION == "2.4.7", f"version bump missing: {config.APP_VERSION}"
+# (예전엔 여기서 APP_VERSION 이 정확히 "2.4.7" 인지 고정 검사했다. 이 파일은 24/7 게이팅과
+# amount 를 검증하는 것이지 버전 번호 자체를 검증하는 게 아닌데, 버전을 올릴 때마다 이 줄을
+# 깜빡하면 그 즉시 이후 모든 빌드가 실패한다 - 2026-07-27 v2.5.0 빌드에서 실제로 이렇게
+# 조용히 깨졌었다(아래 build.yml 의 PowerShell 멀티라인 버그로 실패가 가려져 CI 는 초록이었지만
+# 실제로는 AssertionError 로 죽어 있었다). 버전 고정 검사는 제거한다.)
 
 # v2.4.7: register() 가 rq_addbanner_check 의 amount(배너 잔여)를 결과에 실어야 한다.
 class _FakeResp:

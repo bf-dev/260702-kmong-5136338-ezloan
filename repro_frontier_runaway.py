@@ -89,6 +89,8 @@ def build_registrar():
     r._no_perm_warned = False
     r._relogin_done = False
     r._auth_mismatch_streak = 0
+    r._post_absent_pid = None
+    r._post_absent_streak = 0
     r._wait = lambda s: None
     return r
 

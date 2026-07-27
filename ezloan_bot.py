@@ -54,13 +54,19 @@ _RQ_LINK_RE = re.compile(r'/rq/(\d+)(?:["\'/?#]|$)')
 _POST_PAGE_MIN_BYTES = 1000
 _POST_PAGE_MARKERS = ("배너 등록을 눌러 주세요", "js-memberConfirmView", "rq_addbanner")
 NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission",
-                 # 존재하지 않는(아직 안 생긴) 글에 add 를 걸면 rq_addbanner 가 '404 error'.
-                 # 세션/유료광고 문제가 아니라 '글 없음'이므로 재시도하지 않고 건너뛴다.
-                 "post_absent",
                  # 글은 실재하지만 이 회원 배너가 이미 있거나(재등록 불가) 지금 계정 상태로
                  # 등록 대상이 아님. rq_addbanner 가 result:false('404 error'/'no permission')
                  # 를 주는 개별-글 등록 거부. 세션 사망 아님 -> seen 처리하고 프런티어 전진.
                  "add_refused"}
+# 'post_absent' 는 절대 NON_RETRYABLE 에 넣지 않는다(2026-07-27 실제 재현, 고객 5136338).
+# v2.4.6 이 'open' 후보를 post_exists 확인 없이 즉시 rq_addbanner 로 등록하도록 바꾼 뒤,
+# 실전에서 'rq_addbanner_check 는 통과(계정 정상)했지만 글 페이지가 아직 안 뜬' 찰나의 경쟁이
+# 실제로 발생한다(이지론의 글번호 채번과 페이지 서빙 사이 지연). 그 순간의 post_absent 는
+# '이 번호는 영원히 없다'가 아니라 '아직은 없다'이므로, seen 에 영구 등록해 재시도를 막으면
+# 그 사이 진짜로 생긴 글을 영원히 놓친다(이게 그 자체로 유료 "빠른/신뢰성 있는 등록" 의
+# 정반대 결과였다 - repro_post_absent_race.py 로 재현/고정). 재시도 가능하게 두면 frontier 는
+# 그대로 붙잡혀(전진 안 함) 다음 사이클에 같은 pid 를 다시 확인해, 글이 실제로 뜨는 즉시 등록
+# 된다. 무한 정체 방지는 Registrar._handle 의 post_absent 연속-카운트 giveup 이 담당한다.
 # 진짜 세션 소실/미인증(로그아웃)일 때만 나오는 신호만 여기 둔다.
 # "404 error" 와 "no permission" 은 절대 넣지 않는다(아래 근거).
 #
@@ -442,6 +448,12 @@ class Registrar:
         self._no_perm_streak = 0
         self._no_perm_warned = False   # 계정 힌트 알림은 상태당 1회만(재알람 방지)
         self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
+        # post_absent 재시도 추적('체크는 open인데 페이지가 아직 안 뜬' 찰나의 경쟁, pid 는
+        # 항상 현재 frontier 이므로 같은 pid 가 연속으로 재확인된다). 같은 pid 가 이 횟수 넘게
+        # 계속 post_absent 면(POLL_SECONDS 기준 수 분) 진짜로 없는 번호로 보고 그때만 포기해
+        # seen 처리한다(무한 정체 방지). 그 전까지는 매 사이클 재시도한다.
+        self._post_absent_pid = None
+        self._post_absent_streak = 0
         # '목록은 로그인인데 등록 API 만 404 error 로 거부'되는 상황(auth_mismatch)의 연속 횟수.
         # 세션이 살아있음이 logged_in() 로 확인됐는데도 등록만 계속 거부되면, 이건 세션 사망이
         # 아니라 계정/게시글 측 등록 불가 상태다. 조용히 초당 수십 회 재시도하며 사이트를
@@ -908,6 +920,9 @@ class Registrar:
             self._fresh_refuse_streak = 0
             self._no_perm_streak = 0
             self._no_perm_warned = False
+            if pid == self._post_absent_pid:
+                self._post_absent_pid = None
+                self._post_absent_streak = 0
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
             self.remote("registered", f"post={pid} rank={result['rank']} msg={msg}", force=True)
         elif result.get("ok"):
@@ -917,6 +932,9 @@ class Registrar:
             self._fresh_refuse_streak = 0
             self._no_perm_streak = 0
             self._no_perm_warned = False
+            if pid == self._post_absent_pid:
+                self._post_absent_pid = None
+                self._post_absent_streak = 0
             self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
         elif result.get("session_lost"):
             # 인증 실패. 실행당 1회, 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
@@ -969,12 +987,45 @@ class Registrar:
                 )
         elif note == "post_absent":
             # check 는 통과(세션/유료광고 정상)했으나 글이 아직 존재하지 않아 add 가 '404 error'.
-            # 세션 사망도 유료광고 문제도 아니다. 조용히 건너뛰고(seen 처리됨) 프런티어만 전진.
+            # 세션 사망도 유료광고 문제도 아니다.
+            #
+            # 2026-07-27 실측 버그(고객 5136338, repro_post_absent_race.py): pid 는 항상 지금의
+            # frontier(방금 새로 생긴 번호대)이므로, 이건 대부분 '아직 안 생긴 먼 미래 번호'가
+            # 아니라 '체크는 통과했는데 페이지가 찰나(< 1초~수 초) 늦게 뜬' 경쟁이다. 예전엔
+            # NON_RETRYABLE 이라 여기서 즉시 seen 처리해 재시도를 영구히 막았고, 그 사이 진짜로
+            # 뜬 글을 끝내 등록하지 못했다(고객이 낸 유료 "빠른/신뢰성 있는 등록"의 정반대).
+            # 이제는 재시도 가능하게 둔다: seen 에 넣지 않고, frontier 도 전진시키지 않아(아래
+            # 반환값 False) 다음 사이클에 같은 pid 를 다시 확인 -> 글이 실제로 뜨면 그때 등록된다.
+            # 같은 pid 가 비정상적으로 오래(POST_ABSENT_GIVEUP_STREAK 사이클, 기본 수 분) 계속
+            # post_absent 면 그제서야 '진짜 없는 번호'로 보고 포기(seen 처리 + 알림)한다.
+            if pid == self._post_absent_pid:
+                self._post_absent_streak += 1
+            else:
+                self._post_absent_pid = pid
+                self._post_absent_streak = 1
+            give_up = self._post_absent_streak >= config.POST_ABSENT_GIVEUP_STREAK
             self.remote(
                 "register_post_absent",
                 f"post={pid} status={status} msg={msg} note={note} "
-                "(글 미존재/미래 번호 - 세션·유료광고 정상, 건너뜀)",
+                f"(체크 통과·페이지 미확인 - 연속{self._post_absent_streak}회, "
+                f"{'포기하고 건너뜀' if give_up else '다음 사이클 재시도'})",
+                force=(self._post_absent_streak <= 3 or give_up),
             )
+            if give_up:
+                self.seen.add(pid)
+                self._write_seen()
+                self._post_absent_pid = None
+                self._post_absent_streak = 0
+                self.remote(
+                    "register_post_absent_giveup",
+                    f"post={pid} 연속 {config.POST_ABSENT_GIVEUP_STREAK}회 post_absent - "
+                    "진짜 존재하지 않는 번호로 보고 건너뜀(seen 처리, frontier 전진 허용).",
+                    force=True,
+                )
+                return True   # 포기 = 존재 불가로 확정 -> frontier 전진 허용(폭주 없이 통과).
+            # 재시도 대상: seen 에 넣지 않고 False 를 돌려줘 frontier 도 붙잡아 둔다(폭주 방지
+            # 는 그대로 유지하면서, 다음 사이클에 같은 pid 를 다시 확인해 뜨면 즉시 등록한다).
+            return False
         elif note == "add_refused":
             # 글은 실재하는데 add 가 거부됨(이미 내 배너 있음/계정상태상 등록 불가). seen 에
             # 들어가 재-add 는 막힌다. _handle 은 'seen 에 없는 글'에만 불리므로, 여기 온 건
@@ -996,13 +1047,12 @@ class Registrar:
             self.remote("register_skip", f"post={pid} status={status} msg={msg} note={note}")
 
         # 실존 확정 여부(상위 lookahead 의 프런티어 전진 판단용).
-        #  - post_absent: 아직 안 생긴 미래/유령 번호 -> 실존 아님(전진 금지, 폭주 방지).
+        #  - post_absent: 위 elif 분기에서 이미 return 함(재시도 중이면 False, 포기했으면 True).
+        #    여기 내려온다는 건 post_absent 가 아니라는 뜻.
         #  - check_http_error / add_error / add_failed / session_lost: 존재를 판정 못 했으니
         #    보수적으로 '미확정'(False) -> 프런티어 전진하지 않고 다음 사이클에 다시 시도한다
         #    (실제 새 글을 성급히 지나쳐 놓치지 않도록).
         #  - 그 외(등록 성공/이미 등록/no_permission/add_refused): 글이 실재함 -> 전진 가능.
-        if note == "post_absent":
-            return False
         if result.get("ok"):
             return True
         if note in ("no_permission", "add_refused", "already_registered_api",

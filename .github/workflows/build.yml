@@ -22,13 +22,31 @@ jobs:
       - name: Import smoke
         run: python -c "import config, chrome_provisioner, browser, naver_login, ezloan_bot, bridge, captcha_dialog, session_store, updater, app; print('imports ok')"
 
-      - name: Verify 24/7 + frontier behavior (no regression)
+      # 2026-07-27 gotcha: windows-latest 의 기본 셸(pwsh)은 여러 줄짜리 run: 블록에서 앞선
+      # python 명령이 non-zero 로 죽어도 다음 줄로 계속 진행하고, 스텝의 성공/실패는 '마지막'
+      # 명령의 종료코드만 본다. v2.5.0 빌드에서 실제로 이렇게 verify_247.py 가 AssertionError
+      # 로 죽었는데도 다음 줄(repro_frontier_runaway.py)이 성공해 스텝 전체가 초록으로 보였다
+      # (조용한 회귀-검증 실패 - CI 는 초록인데 실제로는 검증이 하나 죽어있었다). 스텝을 하나씩
+      # 쪼개 각자 독립적으로 실패하게 만든다.
+      - name: Verify 24/7 gating + amount threading (no regression)
         env:
           PYTHONIOENCODING: utf-8   # Windows 콘솔 cp1252 에서 한국어 print 크래시 방지
-        run: |
-          python verify_247.py
-          python repro_frontier_runaway.py
-          python verify_register_latency.py
+        run: python verify_247.py
+
+      - name: Verify frontier-runaway protection (no regression)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_frontier_runaway.py
+
+      - name: Verify register hot-path latency (no regression)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python verify_register_latency.py
+
+      - name: Verify post_absent race is retried, not permanently skipped (2026-07-27 fix)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_post_absent_race.py
 
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
