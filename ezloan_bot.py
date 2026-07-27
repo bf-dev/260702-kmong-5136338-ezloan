@@ -893,6 +893,19 @@ class Registrar:
         생긴 미래/유령 번호)만 False 이고, 그 외(등록 성공/이미 등록/실재하나 거부 등)는 전부
         실존이 확정된 것이므로 True. 안전망(목록) 경로는 반환값을 쓰지 않는다(무해).
         """
+        # v2.5.2 backoff: 같은 pid 가 FAST_RETRY 구간(수십 초, 속도가 실제로 중요한 구간)을
+        # 넘어서도 계속 post_absent 면, 매 사이클 rq_addbanner(WRITE)를 다시 쏘는 대신
+        # BACKOFF_INTERVAL 사이클마다 한 번만 실제로 재시도한다(체크는 lookahead_ids 가 이미
+        # 매 사이클 하고 있으므로 상태 변화 감지는 그대로 유지되고, WRITE 호출만 줄어든다).
+        # giveup 스트릭은 스킵한 사이클도 그대로 세어 giveup 도달 시각은 바뀌지 않는다.
+        if (pid == self._post_absent_pid
+                and config.POST_ABSENT_FAST_RETRY_CYCLES
+                    <= self._post_absent_streak
+                    < config.POST_ABSENT_GIVEUP_STREAK
+                and (self._post_absent_streak - config.POST_ABSENT_FAST_RETRY_CYCLES)
+                    % config.POST_ABSENT_BACKOFF_INTERVAL != 0):
+            self._post_absent_streak += 1
+            return False
         result = register(self.s, pid, precheck=precheck)
         note = result.get("note", "")
         status = result.get("status")

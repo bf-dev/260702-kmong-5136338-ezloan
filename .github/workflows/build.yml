@@ -48,6 +48,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_post_absent_race.py
 
+      - name: Verify post_absent fast-retry/backoff (2026-07-27 v2.5.2, no speed regression)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_post_absent_backoff.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8
