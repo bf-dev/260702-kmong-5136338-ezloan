@@ -3,7 +3,7 @@
 
 import os
 
-APP_VERSION = "2.5.3"
+APP_VERSION = "2.5.4"
 CUSTOMER_ID = "5136338"
 
 # 이지론
@@ -70,14 +70,21 @@ STATIC_BASE = f"https://works.insu.ng/works/public/{CUSTOMER_ID}"
 # 별도 파일(version-ezloan-desktop.json)로 자기 버전을 관리한다.
 VERSION_URL = f"{STATIC_BASE}/version-ezloan-desktop.json"
 UPDATE_CHECK_SECONDS = 60
-# 자동 업데이트 스위치. 2026-07-03 운영자 지시로 껐던 것을 2026-07-27 운영자 지시로 다시 켠다:
-# 그동안(v2.5.0->v2.5.1) 고객이 새 exe 링크를 받고도 실행 중이던 옛 버전을 못 알아채/못
-# 종료해 계속 옛 버전으로 도는 사고가 반복됐다(같은 날 유료 기능 회귀를 겪고도 몇 시간을
-# v2.5.0 로 더 돔). 이 앱은 이미 UpdaterThread(updater.py)+세션 자동복구(session_store.py+
-# app.try_recover_session)를 갖추고 있어(다운로드 크기/Content-Length 검증, .bat 스왑,
-# 재시작 후 네이버 재로그인 없이 등록 자동 재개) 켜도 고객이 직접 할 일이 없다. True 이면
-# 60초마다 version-ezloan-desktop.json 을 폴링해 새 버전을 감지·다운로드·검증 후 자동 교체한다.
-AUTO_UPDATE_ENABLED = True
+# 자동 업데이트 스위치. 2026-07-03 운영자 지시로 껐던 것을 2026-07-27 운영자 지시로 다시 켰다가,
+# 같은 날 실제 라이브 스왑에서 고객 PC가 "검은화면 뜨면서 꺼짐"(실행 안 됨)을 겪어 즉시 다시 끈다.
+# 라이브 증거(artifacts-check 5136338, 06:20-06:23 구간): v2.5.3 프로세스는 [app_started] 딱 한
+# 줄만 남기고 이후 어떤 로그도 없이 사라짐(session_recovered/registrar_init 없음 = 초기화 도중
+# 죽음). 같은 시각 기존 v2.5.2 프로세스는 cycle 카운터가 끊김 없이 계속 올라감(그 프로세스는
+# stop_running_loop 가 걸리지 않았다 = 자기 자신은 스왑을 못 감지했거나 스왑 스레드가 죽었다).
+# updater.py._schedule_restart 는 remote_log(...)(비동기, 별도 스레드에서 HTTP POST)를 호출한
+# 직후 바로 os._exit(0) 을 호출한다 - 데몬 스레드가 요청을 마치기 전에 프로세스 전체가 죽으므로
+# update_downloaded/update_session_saved/update_restart 로그가 서버에 단 한 건도 도착하지
+# 않았다(실측: 해당 이벤트 텍스트로 필터링해도 0건). 그래서 .bat copy/relaunch 자체가 성공했는지
+# 실패했는지조차 원격에서 확인할 수 없는 상태였다 - 자동 업데이트가 자기 자신의 실패를 보고할
+# 방법이 없는 구조였다는 뜻이므로, 원인을 완전히 특정하기 전까지는 다시 켜지 않는다. 재도입하려면
+# 최소한 (1) _schedule_restart 의 remote_log 를 os._exit 전에 동기적으로 완료시키거나 join, (2)
+# .bat 의 copy/start 실패를 감지해 원래 exe 로 안전하게 되돌리는 폴백을 먼저 넣을 것.
+AUTO_UPDATE_ENABLED = False
 
 # 프로그램이 자체 관리하는 크롬(Chrome for Testing) / 프로필 위치
 _HOME = os.path.expanduser("~")
