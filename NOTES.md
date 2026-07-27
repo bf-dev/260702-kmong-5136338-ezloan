@@ -322,3 +322,89 @@ for, and it's now fixed and verified against a reproduction of the exact failure
 whether any goodwill gesture is warranted (owner's call) given this was a same-day regression on a
 paid feature - flagging per owner-monetize-improvements-not-free.md's spirit that pricing/goodwill
 decisions here are the owner's, not mine to decide unilaterally.
+
+---
+
+## 2026-07-27 — v2.5.2: post_absent fast-retry/backoff + AUTO_UPDATE_ENABLED back ON
+
+Owner instruction (relayed via the engineer-subagent task, same day as the v2.5.1 fix above):
+review whether v2.5.1's retry-not-blacklist fix is conservative enough, or whether the v2.4.6
+speed optimization itself needs partial reversion; and separately, turn auto-update back on
+since the customer kept running the wrong exe (stayed on v2.5.0 for hours after v2.5.1 was
+already hosted and linked, and hit the exact post_absent bug live because of it).
+
+ENGINEERING DECISION on the retry design (documented for the next engineer, in case this comes
+up again): did NOT reintroduce the pre-v2.4.6 post_exists() pre-check on the first probe of a
+new post ID. That would defeat the entire point of the speed fix - the "first probe of a
+never-before-seen id" IS the exact moment we're racing to win, so adding a 288KB existence
+fetch there re-adds the 200ms+ latency that lost the 1등 race in the first place (this is
+literally what v2.4.6 removed and what the customer paid 50,000원 to get back). Instead, kept
+v2.5.1's fire-immediately-and-retry-on-failure architecture (fire now, correctness via retry
+is cheaper than correctness via pre-check) and made ONLY the retry schedule more conservative:
+
+  config.POST_ABSENT_FAST_RETRY_CYCLES = 40   (0.8s * 40 = ~32s)
+  config.POST_ABSENT_BACKOFF_INTERVAL = 5     (every ~4s after the fast window)
+
+For the first ~32s after a post_absent hit (comfortably covers the "수초~수십초" real page-
+reflection delay already measured live for this customer, see the v2.5.1 section above),
+`Registrar._handle` still fires `rq_addbanner` every single 0.8s poll cycle exactly like
+v2.5.1 - zero speed regression for the realistic race window, which is where the customer's
+paid feature actually matters. Only if the SAME pid is still post_absent past that window
+(meaning it's very likely a genuinely-nonexistent/skipped id, or ezloan is having a real
+outage) does `_handle` start skipping the actual `register()`/WRITE call on non-tick cycles
+(still counting the streak so the existing POST_ABSENT_GIVEUP_STREAK=500 giveup timing is
+unchanged) - this cuts a worst-case ~500 back-to-back WRITE hits down to roughly ~100, more
+polite to ezloan's server without slowing down real registrations. `probe_state`'s cheap
+check-endpoint read (via `lookahead_ids`) still runs every cycle regardless, so a state change
+(post goes live, or account state changes) is still detected within one poll interval - only
+the WRITE retries are throttled, not detection.
+
+New CI-gated repro: `repro_post_absent_backoff.py` (added as its own build.yml step, same
+one-script-per-step pattern as the other verify/repro scripts). Two scenarios: (1) page goes
+live inside the fast window -> registers on the very next cycle, same as v2.5.1 (no speed
+regression - asserts registration happens at or before FAST_RETRY_CYCLES); (2) page goes live
+well past the fast window -> asserts the actual `rq_addbanner` call count is well below the
+cycle count (backoff is real) AND that it still eventually registers (not abandoned).
+
+AUTO_UPDATE_ENABLED: False -> True (config.py). Rationale: `updater.py`'s UpdaterThread was
+already fully built and unused (dev-mode `sys.frozen` guard means it never mattered before) -
+polls `version-ezloan-desktop.json` every 60s, downloads the new exe to a temp path, verifies
+Content-Length AND a >5MB floor before trusting it, then does the standard .bat-swap-and-
+relaunch pattern. Paired with existing `session_store.py` + `app.try_recover_session()`
+(called from `main.py` on every startup): after the swap-relaunch, the new process loads the
+saved ezloan/Naver session cookies from disk and auto-resumes the registration loop with ZERO
+customer interaction - no re-login, no clicking [시작] again. This was already wired before
+today; only the config flag was off. Verified end-to-end THIS session (not just code review):
+a Python process with `config.APP_VERSION` monkeypatched to "2.5.1" polled the REAL hosted
+`https://works.insu.ng/works/public/5136338/version-ezloan-desktop.json`, correctly detected
+2.5.2 as newer, downloaded and Content-Length/size-verified the actual live-hosted exe, called
+`stop_running_loop`, and reached the `.bat`-swap step (which no-ops here only because this dev
+process isn't a frozen Windows exe - `update_skip_dev` fired exactly as designed). This proves
+the whole detect -> download -> verify -> (would-swap) chain works against the real artifacts
+end to end; only the actual Windows file-swap+relaunch itself is untested outside a real
+Windows process (by construction - PyInstaller-frozen-only code path).
+
+If AUTO_UPDATE_ENABLED ever needs turning off again (e.g. a future update introduces a bad
+build and needs the customer pinned): just flip the flag back to False in config.py and ship
+a build; do not delete `version-ezloan-desktop.json` (harmless either way, only read when the
+flag is True).
+
+DELIVERY: GitHub Actions run 30239403889, all 11 verify/build/screenshot steps green including
+the new backoff repro and the real Windows GUI screenshot self-test (window renders correctly,
+아이디/비밀번호/시작/정지 all visible). Downloaded + verified `PE32+ executable (GUI) x86-64`,
+33,271,496 bytes (sha256 bdb0fae091fa7d51742f588fb42d37a2a71c6121d7e0709431f6bfd9b584d1d7).
+Hosted at THREE paths (all curl -I -> HTTP 200, content-length 33271496 matching):
+  - `ezloan-desktop-2.5.2.exe` (versioned, this is what `version-ezloan-desktop.json.exeUrl`
+    points at - auto-update MUST only ever reference a versioned filename per the Cloudflare-
+    cache gotcha elsewhere in this file)
+  - `ezloan-desktop-update.exe` (canonical version-free link, reused/overwritten by convention
+    same as v2.5.0/v2.5.1 - for manual chat-link delivery only, never referenced by the updater)
+  - `version-ezloan-desktop.json` = `{"version":"2.5.2","exeUrl":".../ezloan-desktop-2.5.2.exe"}`
+    (cf-cache-status: DYNAMIC, i.e. not cached - the updater's `Cache-Control: no-cache` request
+    header plus this being a small JSON keeps it fresh on every poll)
+
+Customer is STILL on v2.5.0 as of this delivery (artifacts-check confirms, frontier pinned at
+30831 = the exact post_absent bug from earlier today) - v2.5.2 needs to be delivered/relaunched
+manually ONE more time (this build predates the customer ever running an auto-update-enabled
+exe, so there is nothing to auto-update FROM yet). Once the customer runs v2.5.2 (or any future
+build), all subsequent updates should be automatic - no more manual relaunch sagas.
