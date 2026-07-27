@@ -408,3 +408,242 @@ Customer is STILL on v2.5.0 as of this delivery (artifacts-check confirms, front
 manually ONE more time (this build predates the customer ever running an auto-update-enabled
 exe, so there is nothing to auto-update FROM yet). Once the customer runs v2.5.2 (or any future
 build), all subsequent updates should be automatic - no more manual relaunch sagas.
+
+---
+
+## 2026-07-27 — v2.5.3 shipped a real post_absent GIVEUP fix, then the FIRST live auto-update
+## swap broke the customer's running install ("검은화면 뜨면서 꺼지네용" / "실행이 안 됩니다")
+
+Same day, ~1hr after v2.5.2 (auto-update ON): live-found a second post_absent regression
+(customer 5136338, post 30834) — GIVEUP added the pid to `self.seen`, the SAME set the list
+safety-net excludes every cycle, so a post that took >8min (GIVEUP window) to actually appear
+on ezloan was silently skipped FOREVER even though the safety-net rescans every cycle. Fixed
+in b904224 (v2.5.3): GIVEUP now uses a separate `_post_absent_giveup` set so the frontier-probe
+retry stops (that's GIVEUP's job) but the list safety-net still sees the pid and registers it
+once it's genuinely live. New CI-gated repro `repro_post_absent_giveup_then_real.py`. This part
+is a genuine, well-tested fix and is NOT implicated in what follows.
+
+version-ezloan-desktop.json was flipped to 2.5.3 right as the customer's already-running v2.5.2
+(AUTO_UPDATE_ENABLED=True from earlier today) was mid-retry-storm on post 30837. This was the
+FIRST real (non-simulated) live auto-update swap this app has ever done. Within ~1-2 minutes
+the customer reported the program not launching at all; live description: "그냥 실행하면
+검은화면 뜨면서 꺼지네용" (black screen flashes then closes).
+
+ROOT-CAUSE INVESTIGATION (artifacts-check 5136338, full history around 06:19-06:23 UTC):
+- `ezloan-desktop-v2.5.3` has EXACTLY ONE log row, ever: `[app_started] 버전 2.5.3` at
+  06:20:51.586Z. No `session_recovered`/`session_recover_none`/`registrar_init` ever followed —
+  the process died during/right after `App.__init__` (Tk window construction), before
+  `try_recover_session()`'s background thread could log anything. One clean log line then
+  silence is the signature of the process being killed externally (not a Python exception,
+  which would still usually leave SOME trace via the try/except-wrapped call sites), or of
+  something replacing/corrupting the exe file out from under a process that had just execed it.
+- Meanwhile the OLD `ezloan-desktop-v2.5.2` process kept logging `[cycle]` continuously through
+  the entire window (#305→#316→#327→...→#403, zero gap in the normal ~10-15s cadence) — i.e.
+  its own updater thread was never observed to call `stop_running_loop`/exit at all. A THIRD,
+  fully-fresh `v2.5.2` app_started (baseline reset, frontier reset to 30837, cycle #1) appears
+  at 06:22:38 — most likely the customer manually double-clicking their existing (old) desktop
+  exe after seeing nothing running.
+- Searched ALL 73,976 log rows for this customer for `update_downloaded` / `update_session_saved`
+  / `update_restart` / `update_skip_dev` / `update_download_incomplete` / `update_too_small` /
+  `update_download_failed` (the updater's own instrumentation) — ZERO matches, ever. Root cause:
+  `bridge.remote_log()` is fire-and-forget (spawns a daemon thread, returns immediately);
+  `UpdaterThread._schedule_restart()` calls `remote_log("update_restart", ..., force=True)` and
+  then IMMEDIATELY `subprocess.Popen(...)` + `os._exit(0)`. `os._exit()` kills the whole process,
+  including the logging thread, before its `requests.post()` can complete — so the swap can
+  NEVER report its own progress/failure. This is a real, independently-fixable bug (regardless
+  of whether it's the actual cause of the launch failure): join/wait on the log thread (or send
+  synchronously) before `os._exit(0)`, in all three pre-exit `remote_log` call sites in
+  `_schedule_restart`/`_check_once`.
+- Confirmed via `gh run view` on the v2.5.3 build (run 30242362847): the "GUI construct
+  self-test and Windows screenshot" CI step PASSED — the exact same exe launched cleanly on a
+  fresh `windows-latest` runner (window rendered, screenshot captured, clean exit). So the
+  compiled v2.5.3 binary is NOT inherently broken code; the failure is specific to the LIVE
+  SWAP on the customer's own machine. Leading candidate (not directly provable without customer
+  machine access): Windows Defender/SmartScreen intercepting a freshly-downloaded, unsigned exe
+  written by the `.bat` helper (the customer's already-running exe may be trusted/excluded by
+  now, but a brand-new download dropped via `copy /y` is not) — this fits "one process starts,
+  dies almost immediately, nothing further" exactly, and fits the customer's own "black screen
+  flashes and closes" description (SmartScreen/Defender interstitial, not the app's own GUI —
+  the app is built `--noconsole` so it has no console of its own to show).
+- Could NOT confirm or rule out a `.bat` copy/relaunch failure with certainty — the diagnostic
+  gap above (updater logs never sent) is exactly why. If auto-update is ever re-enabled, fix
+  that gap FIRST so the next incident is diagnosable from artifacts-check alone.
+
+FIX (v2.5.4, config.py only): `AUTO_UPDATE_ENABLED` reverted `True → False`. Owner is manually
+sending the customer a fresh exe (per convention: this build predates any working auto-update,
+so it must be manually run once). Rationale for going back to manual-only rather than
+re-enabling with a patch: the actual failure mode on the customer's live machine is still not
+100% pinned down (Defender/SmartScreen is the leading theory, not a proven one), so shipping
+another auto-swap right now would be gambling with the same paying customer's running install a
+second time in one day. DO NOT re-enable AUTO_UPDATE_ENABLED without first: (1) fixing the
+`os._exit(0)`-before-log-flush bug above so a future swap failure is actually diagnosable, and
+(2) ideally getting Defender/SmartScreen evidence one way or the other (e.g. ask the customer
+whether they saw a SmartScreen "Windows protected your PC" prompt, or check
+`%LOCALAPPDATA%\...\WER` / Defender history if we ever get remote access).
+
+version-ezloan-desktop.json was ALSO updated to point at 2.5.4 (not left on the broken 2.5.3):
+any customer machine still polling with an old AUTO_UPDATE_ENABLED=True binary (v2.5.2 or the
+one-shot-dead v2.5.3) needs a safe landing spot, and 2.5.4 is code-identical to known-good
+v2.5.2 plus the legit GIVEUP fix, with auto-update now permanently off once it lands (so it
+cannot loop into another swap attempt). This does still rely on the SAME swap mechanism that
+just failed once, so it is not a hard guarantee, but leaving the manifest pointed at a build
+that logs-and-dies is strictly worse.
+
+DELIVERY: GitHub Actions run 30243634265, all steps green including the real GUI screenshot
+self-test (window renders correctly: 네이버 아이디/비밀번호/시작/정지 all visible,
+`tmp` copy at time of writing — screenshot not kept in repo). Downloaded + verified
+`PE32+ executable (GUI) x86-64`, 33,274,759 bytes, sha256
+a457eae1553b7af1aa7d61b5bf27eff1df936ea488160470d2c5a6f497a31830. Hosted at:
+  - `ezloan-desktop-2.5.4.exe` (versioned; `version-ezloan-desktop.json.exeUrl` points here;
+    never served before so guaranteed NOT edge-cache-stale — confirmed `cf-cache-status: HIT`
+    but with the CORRECT fresh content-length/sha immediately, since it's a brand-new filename).
+  - `ezloan-desktop-update.exe` (canonical version-free link, overwritten by convention) — **BUT
+    Cloudflare's edge cache (max-age=14400) was still serving the STALE 2.5.2 bytes for this
+    filename minutes after the overwrite** (`cf-cache-status: HIT`, `age: ~5100`, wrong
+    content-length) because this exact filename was already cached from an earlier delivery.
+    Workaround verified: `ezloan-desktop-update.exe?v=254` (any cache-busting query string)
+    returns the correct fresh 2.5.4 bytes immediately (`content-length: 33274759`, no stale
+    age). **If handing the owner/customer the version-free link for manual delivery, use the
+    `?v=254`-suffixed URL, or wait for the ~4h cache TTL to lapse, or confirm
+    `curl -sI .../ezloan-desktop-update.exe` (no query string) shows the CORRECT content-length
+    before sending it as-is.** No Cloudflare purge token was found in this workspace for the
+    works.insu.ng zone; if this recurs often, get one (or switch canonical-link convention to
+    a fully fresh filename each time, like the versioned one, and stop overwriting a served
+    name at all — the NOTES "hard-won gotchas" section already warns about exactly this for the
+    auto-update path; it turns out it bites the manual-delivery canonical link too).
+
+Honest line for the customer: v2.5.3's post_absent GIVEUP fix is real and correct, but the very
+first live use of the auto-updater we turned on today broke their running program for a few
+minutes. Auto-update is now off again; v2.5.4 (same fix, no auto-update) needs to be run once
+manually, same as always before today.
+
+---
+
+## 2026-07-27 — 30836 diagnosis (correct behavior) + v2.5.3 GIVEUP-poisons-seen fix + live auto-update incident -> v2.5.4
+
+Customer live complaint: "2등으로 올라가다가 또 누락 하나 됐네용" while artifacts-check showed
+`[register_post_absent] post=30836` grinding 290+ consecutive cycles.
+
+### Part 1: was 30836 a bug? No - live-confirmed correct behavior.
+
+KR egress (unicorn@external-8) direct curl: `/rq/30834` through `/rq/30838` all returned
+HTTP 200 but with a 353-byte body `"삭제되었거나 존재하지 않은 문의입니다"` (deleted/does-not-exist),
+and the real `/rq` list's true max was 30833 at the time. So 30834/35/36 genuinely did not
+exist yet - the app's post_absent detection was factually correct, not a false read.
+Watched the FULL v2.5.2 retry/backoff/giveup cycle complete live, three times in the same
+session, with zero manual intervention:
+  30834 GIVEUP 05:51:38, 30835 GIVEUP 05:59:51, 30836 GIVEUP 06:08:06 (each exactly ~8m11s,
+  matching FAST_RETRY_CYCLES=40 + BACKOFF_INTERVAL=5 up to GIVEUP_STREAK=500 at 0.8s poll).
+Also confirmed the listing safety net (poll() step 2, runs every cycle on the SAME /rq fetch
+used for frontier-resync, independent of the phantom-id grind in step 1) is what actually
+guarantees fast detection of a REAL new post regardless of the speculative frontier-probe's
+state - so the giveup grind never delays real registration, only wastes some WRITE calls on
+phantom future ids.
+
+Other posts today (v2.5.0, before the giveup incident): 30826 rank=1, 30828 rank=2, 30830
+rank=1, 30832 rank=1 - all registered correctly. So today was NOT a systemic v2.5.2 problem.
+
+### Part 2: the ACTUAL one-off miss - post 30833 (matches "누락 하나")
+
+30833 IS live (291KB real page) and 585(더원대부) is genuinely absent from its 11 registered
+banners (room remained, not slots-full). Root cause: v2.5.0 (still running with the pre-2.5.1
+post_absent-is-NON_RETRYABLE bug) probed 30833 once before it existed and gave up on it
+permanently; then the customer's app restarted to v2.5.2 right as 30833 went live, and the
+restart-baseline logic ("최대번호=30833, frontier=30834") deliberately treats a post that
+already exists AT STARTUP as old/already-decided (safety feature to avoid double-registering
+history on restart) - so NEITHER version ever attempted a register() write on 30833. One-off,
+caused by the restart landing in the exact same few seconds as a new post, not a wider bug.
+
+### Part 3: found+fixed a REAL bug live, mid-investigation - GIVEUP poisons self.seen
+
+While live-monitoring 30834 after its GIVEUP (05:51:38), re-checked ezloan.io ~19 minutes
+later (06:10-06:11) and found 30834 had become a genuinely real, live post (291KB page, only
+5 banners registered, room remained) - and the app NEVER attempted to register it. Root cause
+(ezloan_bot.py `_handle`, giveup branch): GIVEUP added the pid to `self.seen`, the exact same
+set the listing safety net (`new = [i for i in ids if i not in self.seen]`, poll() step 2)
+uses to decide what's "new". Once poisoned into `self.seen`, a pid is invisible to BOTH the
+frontier-probe retry AND the listing safety net, forever - even though the whole point of the
+listing safety net is to catch exactly this case (a post that showed up in the real list).
+
+Fix (v2.5.3, ezloan_bot.py): GIVEUP now adds the pid to a new, separate in-memory set
+`self._post_absent_giveup` instead of `self.seen`. This still stops the expensive
+frontier-probe retry/backoff grind (checked in the lookahead loop: `if pid in self.seen or
+pid in self._post_absent_giveup: continue`), but leaves the pid visible to the listing safety
+net (still keyed on `self.seen` only), so if it later appears in the real `/rq` list it
+registers normally. New CI-gated repro `repro_post_absent_giveup_then_real.py` drives the
+real Registrar/_handle/lookahead_ids code: fails against the pre-fix behavior (pid stuck in
+`self.seen` after GIVEUP, register never re-attempted) and passes after the fix (pid goes to
+`_post_absent_giveup`, listing safety net catches it once it's actually live). All 9
+verify/repro scripts pass clean (exit 0) after the fix, no regressions.
+`_post_absent_giveup` is in-memory only (not persisted) - restart-baseline resync already
+handles the cross-restart case safely on its own (see Part 2).
+
+KNOWN RESIDUAL LIMITATION (not fixed, low-impact, documented not silently skipped): the
+customer's on-disk `seen.json` (persisted, capped at last 1000 entries) already had "30834"
+written into it by the OLD pre-fix code at the moment GIVEUP fired (`self.seen.add(pid);
+self._write_seen()`, before this fix). So even after the customer runs a fixed build, THAT
+SPECIFIC pid (30834) stays permanently excluded via the stale on-disk entry - the code fix
+only prevents this from happening to any FUTURE giveup from now on. Not safe to try to
+"clean" seen.json remotely: it's a mix of legitimately-processed ids and the one poisoned
+entry, and no signal distinguishes them without risking a duplicate-registration bug on real
+history. Net effect: 30834 itself remains a permanent one-off miss, same category as 30833
+(Part 2) - both are already-lost single posts, not a recurring pattern.
+
+### Part 4: LIVE INCIDENT caused while delivering v2.5.3 - auto-update crashed the running app
+
+To deliver the v2.5.3 fix, `version-ezloan-desktop.json` was bumped to point at the freshly
+built+hosted `ezloan-desktop-2.5.3.exe` (AUTO_UPDATE_ENABLED was already True since v2.5.2).
+The customer's live v2.5.2 process picked it up and attempted the swap. Result (artifacts-
+check 5136338, 06:20:51): the new v2.5.3 process logged exactly ONE `[app_started]` line and
+then nothing - no `session_recovered`/`registrar_init`/`run_started` - meaning it died during
+init, while the OLD v2.5.2 process kept running uninterrupted throughout (cycle counter never
+broke stride: #316 -> #327 -> ... -> #403), meaning the updater thread never got a clean
+handoff either. CI proves the v2.5.3 exe itself launches fine on a clean Windows runner (GUI
+self-test screenshot green) - this is NOT a code regression in the exe, it's specific to the
+live swap on the customer's actual machine. Leading theory (owner, commit b150ef6): Windows
+Defender/SmartScreen flagging the freshly-downloaded unsigned exe. Also found the swap's own
+diagnostics are untrustworthy: `updater.py._schedule_restart` fires `remote_log(...)` (async,
+fire-and-forget thread) immediately before `os._exit(0)` - the process dies before that HTTP
+POST can complete, so `update_downloaded`/`update_session_saved`/`update_restart` never
+reached the server for this incident (grepped 0 matches) - the auto-updater has no way to
+report its own failure.
+
+RESPONSE (fast, two layers):
+  1. Owner (commit b150ef6, same session): `AUTO_UPDATE_ENABLED` back to `False` in config.py,
+     version bumped to 2.5.4, pushed+built via CI (run 30243634265, green, all 9 verify/repro
+     steps incl. the new giveup repro). This stops any FUTURE build from attempting the same
+     swap until the failure mode above is actually understood (defender/SmartScreen theory
+     unconfirmed - untested).
+  2. Engineer-subagent (this session, immediately on discovering the above): the customer's
+     ALREADY-RUNNING v2.5.2.exe is compiled with `AUTO_UPDATE_ENABLED=True` baked in and keeps
+     polling `version-ezloan-desktop.json` every 60s regardless of what config.py says in the
+     repo now - so leaving that JSON pointed at 2.5.3 (or bumping it to 2.5.4) would make the
+     live process retry the SAME crash-prone swap every ~60s forever. Reverted
+     `version-ezloan-desktop.json` back to `{"version":"2.5.2", exeUrl: .../ezloan-desktop-
+     2.5.2.exe}` (matching what's already installed and running) so `latest <= current` and
+     the live process stops attempting any further swap. Verified: customer's v2.5.2 process
+     kept running cleanly afterward (cycle counter climbed #11 -> #73 with zero further
+     `[app_started]` interruptions, confirmed via artifacts-check).
+
+CURRENT STATE: customer is on v2.5.2 (stable, running, NOT the giveup-poisons-seen bug fixed,
+NOT auto-updating - that's fine, it's just running normally). v2.5.4 (post_absent-giveup fix
++ AUTO_UPDATE_ENABLED=False) is built, verified as a real `PE32+ executable (GUI) x86-64`
+(33,274,759 bytes, sha256 a457eae1553b7af1aa7d61b5bf27eff1df936ea488160470d2c5a6f497a31830),
+and hosted ONLY at the versioned URL (curl -I -> 200, content-length matches):
+  https://works.insu.ng/works/public/5136338/ezloan-desktop-2.5.4.exe
+Deliberately did NOT overwrite the shared `ezloan-desktop-update.exe` canonical alias this
+round (it's already in a stale-cache-mixed state from the mid-incident copy - Cloudflare edge
+cache gotcha, see elsewhere in this file - and since auto-update is off, nothing consumes that
+alias automatically anyway). MUST be delivered to the customer as a MANUAL download+run (same
+as every pre-2.5.2 build) - do NOT re-enable AUTO_UPDATE_ENABLED or re-point
+version-ezloan-desktop.json at 2.5.4 until the live-swap-crash root cause (Defender/
+SmartScreen theory) is actually confirmed and, ideally, `updater.py._schedule_restart` is
+fixed to (a) flush/join the remote_log POST before `os._exit`, and (b) detect a failed
+.bat copy/relaunch and fall back to the original exe instead of leaving the customer with
+nothing running. Neither of those code fixes has been made yet - this is the next open item.
+
+NEXT ENGINEER: if asked to re-enable auto-update or investigate the swap crash further, start
+here; do not blindly flip `AUTO_UPDATE_ENABLED` back on without addressing the two updater.py
+gaps above, and confirm on a real Windows box (not just CI's clean runner) whether Defender/
+SmartScreen is actually the blocker (e.g. check `Get-MpThreatDetection` / quarantine, or add
+code-signing) before trying again.
