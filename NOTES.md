@@ -92,3 +92,143 @@ the confirmed customer action). Until then the honest line to the customer: app 
 and detecting every new post instantly; ezloan is refusing registration ("등록 대상 아님") on most posts,
 which is an account/광고상품 잔여 signal, and v2.4.7 will show the exact remaining count next run.
 DO NOT flatly assert "your account lapsed" without the 배너잔여 number (that misdiagnosis burned trust twice).
+
+## 2026-07-21 follow-up — DEFINITIVE cause of "no permission" (credits ruled OUT by live proof)
+Customer confirmed "잔여가 넉넉합니다" (credits plenty), so the v2.4.7 "credits low" hypothesis is DEAD.
+Re-diagnosed live via KR egress (unicorn@external-8, read-only, NO account login). Evidence:
+
+- The ingest log has TWO sessions. Session 1 (pre-restart, ends 00:55:25) ran with cumulative 등록=195
+  and, in the captured window, refused 30503-07 (새글연속거부 10->14). RESTART at 00:55:25 (baseline
+  frontier=30508). Session 2 registered EXACTLY post 30508 at 01:02:03 (등록 0->1), then refused
+  30509/30510. That is the "restart -> 1 registers -> then refused" pattern, reproduced in the log.
+  frontier reached 30511 == ezloan's real latest post => app is CAUGHT UP, not stuck. Session healthy.
+
+- LIVE count of advertiser 585 (더원대부) active banners: scanned /rq/30410..30512. 585 is present on a
+  LONG CONTIGUOUS band ~30410-30492 (60+ posts), then ABSENT on the entire 30493-30507, ONE lone
+  success at 30508, absent 30509-30511. So the concurrent-cap hypothesis is FALSIFIED: 585 holds 60+
+  active banners at once, not ~4-5. There is NO small concurrent cap. (Prior "on only 4 posts" was a
+  narrow 30490-30511 window; widening the scan showed the full 60+ band.)
+
+- The boundary is a TIME cutover, not a count. /rq list ages: post 30492 (last WITH 585) = 15시간전,
+  30494 (first WITHOUT) = 13시간전. So 585 stopped getting registered ~13-15h before the check, i.e.
+  around midday 2026-07-20 KST. Everything BELOW that moment has 585; everything above refuses.
+
+- Site + new-post pipeline are FINE for other advertisers: competitor /l/325 is on EVERY post through
+  the newest 30511 (even 2x on some). So this is 585-account-specific, not a site outage or slot race.
+
+- Server response semantics (from ezloan's OWN /res/js/script.js, lines 8843 check / 9000 write):
+  rq_addbanner_check msgMap: no permission / no amount / no ads / no payed ads / max / ing.
+  rq_addbanner (WRITE) msgMap: ONLY no amount / no ads / no payed ads / 404 error (NO "no permission").
+  The app logs `msg=no permission` from the WRITE after check returned result:true (=account has
+  credits AND a paid ad, since check gates on both). So it is NOT no amount (credits), NOT max (slots),
+  NOT ing (already reg), NOT session death. It is an account-state refusal on the write.
+
+- ROOT CAUSE (matches the 2026-07-10 authed live finding already in this file's SESSION_LOST_MSGS
+  comment): "쿠키는 동일한데 결과만 시간에 따라 바뀐다 -> 서버측 계정 할당/기간 제한 상태". ezloan
+  imposes a per-account time/quota window on how many/how long 실시간 배너 can be actively placed.
+  585 hit that window ~13-15h ago; existing banners stay up (60+) but NEW placements are refused with
+  "no permission" until the window rolls / an old banner expires (which is why exactly 1 sneaks in on a
+  restart / when a slot frees). On 2026-07-10 the same signature was tied to the 메인배너 유료광고 상품
+  lapsing to D-5; the customer even noted "연장 전에도 순위 적용은 되더라" = partial success while near
+  the limit, identical to today's occasional 30508 success.
+
+RESOLUTION (honest): this is INHERENT ezloan account-side behavior, NOT an app bug and NOT fixable in
+code. Nothing in the client can force ezloan to accept a write it is refusing. Two customer-side checks:
+  (1) 이지론 내정보 > 광고 상품(메인배너 유료광고)이 '진행 중' 상태인지 + 남은 기간(D-day). If it lapsed
+      or is throttled, that is the gate (exactly the 07-10 fix). Credits (실시간 배너 잔여) being plenty
+      does NOT satisfy this: the WRITE needs an ACTIVE paid 광고상품, separate from 잔여 개수.
+  (2) Ask ezloan whether there is a cap on concurrent/active 실시간 배너 or a daily placement quota per
+      advertiser. 585 sits at 60+ active banners; if ezloan caps active placements, new ones only land
+      as old ones expire off the bottom (banner ROTATION, not simultaneous growth). Set that expectation.
+The app is already doing everything right: instant detection, immediate rq_addbanner, correct skip on
+refusal, frontier tracking ezloan's true latest. It will auto-resume the moment ezloan stops refusing.
+
+DO NOT tell the customer "your credits ran out" (proven false) or "your account lapsed" without them
+confirming the 광고상품 진행상태. The honest line: app+login healthy and catching every new post
+instantly; ezloan is refusing NEW banner writes on this account since ~midday 07-20 while keeping the
+existing 60+ banners up; this is ezloan's account-side 광고상품/기간 제한, check 광고 상품 진행중 상태 +
+ezloan 문의 on any active-banner/daily quota. Live evidence saved: tmp/ezloan_30508.html,
+tmp/ezloan_script.js (this host, tmp is pruned in 14d).
+
+---
+
+## 2026-07-23 — transient login slowness + CLEAN v2.4.5 login-auto-retry delivery (customer 5136338)
+
+SYMPTOM: customer 5136338 on v2.4.4 hit repeated Naver/이지론 login failures (7 manual
+retries). Ingest log sequence: app healthy to 02:15 (등록=111) -> [run_stopped] (customer
+manually stopped the loop) -> cold re-logins hit [login_failed]/[login_temporarily_unavailable]
+"네이버 로그인 폼이 제때 열리지 않았습니다" -> [session_recover_none]. This is the v2.4.4
+give-up-after-~4-tries/~1min behavior (the screenshot's "1/4 2/4 3/4 -> 잠시 후 시작 다시").
+
+LIVE-STATE FINDING (Task 1) = TRANSIENT SLOWNESS, NOT a broken selector. Verified via KR-egress
+house SOCKS (external fleet, egress AS16509 Incheon KR):
+  - nid.naver.com/nidlogin.login: HTTP 200 (0.31-1.08s across 3 nodes); form INTACT: id="id",
+    id="pw", name="id", name="pw", btn_login all present -> app selectors (By.ID "id"/"pw",
+    button.btn_login) still match. No 보호/idSafetyRelease/점검 markers.
+  - ezloan.io/m/login: HTTP 200 (0.47-1.6s); .js-loginBtn[data-type="naver"] present. No
+    error/maintenance markers.
+  - CONFIRMED by the customer's own app: it RECOVERED on its own at 02:32 (artifacts-check shows
+    fresh [cycle] 세션없음연속=0 frontier=30626 -> logged in + polling again, no code change).
+  NEVER logged into the customer's Naver account (that protection-locks it). Pages fetched only.
+
+DELIVERY (Task 2) = clean v2.4.5, login auto-retry ONLY, WITHOUT the paid v2.4.6 speed fix.
+  - v2.4.5 = commit d644ec2 (login() 20-min auto-retry backoff + error-page detector hardening;
+    naver_login.py/app.py/config.py). It is a LINEAR ANCESTOR of v2.4.6, so it contains ZERO of
+    the speed changes. Proof: d644ec2:config.py has APP_VERSION="2.4.5", POLL_SECONDS=1.5 (slow
+    original), AUTO_UPDATE_ENABLED=False; the 135-line ezloan_bot.py hot-path rewrite + POLL 0.8
+    are in cab6124 (v2.4.6), a LATER commit not on this branch.
+  - Built on GitHub Actions windows-latest from pushed branch build/v2.4.5-login @ d644ec2 (run
+    29974549756, all verify steps incl. login-resilience + error-page-detector PASSED). Artifact
+    upload hit storage quota; exe came from the Release step: ezloan-desktop-2.4.5.exe (33270468 B,
+    PE32+ GUI x86-64).
+  - HOSTED VERSION-FREE (distinct from ezloan-desktop-update.exe, which == v2.4.6 paid build):
+    https://works.insu.ng/works/public/5136338/ezloan-desktop-login.exe  (curl -I -> HTTP 200).
+    Do NOT reuse ezloan-desktop-update.exe for the login-only build.
+  - bridge.py reporting intact (source ezloan-desktop-v2.4.5, customerId 5136338). AUTO_UPDATE off.
+
+Build branch build/v2.4.5-login left on origin for reproducibility.
+
+---
+
+## 2026-07-27 — v2.5.0: PAID "1등 등록속도 업그레이드" delivered (customer paid 50,000원)
+
+Customer paid for the full speed upgrade proposed on 2026-07-17 (memory
+1deung-upgrade-pending.md). `main` already had everything needed in one clean linear
+history (no merge/rebase was needed):
+  d644ec2 (v2.4.5 login auto-retry) -> cab6124 (v2.4.6 hot-path speed fix, reclaim 1등)
+  -> 708b050/a9d9f59 (v2.4.7 배너잔여 diagnostic logging, no register/frontier behavior change).
+Verified cab6124's hot-path is still intact at HEAD: probe_state's 'open' branch does NOT call
+post_exists before registering, register() reuses the lookahead precheck, and lookahead_ids
+still returns (pid, precheck) tuples with post_absent gating safe_frontier (grep-verified in
+ezloan_bot.py, matches the v2.4.6 NOTES section above).
+
+Action taken: bumped APP_VERSION 2.4.7 -> 2.5.0 (config.py) to mark this as the paid-delivery
+milestone; no functional code change beyond the version bump (the functional work was already
+on main from v2.4.5/2.4.6/2.4.7). Ran all 5 CI verify scripts locally before pushing
+(verify_247, repro_frontier_runaway, verify_register_latency, verify_login_resilient,
+verify_error_page_detector) - all PASSED, confirming zero regression. Built via GitHub Actions
+windows-latest (push to main). Published to the CANONICAL version-free URL (per owner
+instruction that the free/paid filename split no longer matters now that the customer paid for
+the full thing):
+  https://works.insu.ng/works/public/5136338/ezloan-desktop-update.exe  (now == v2.5.0, not v2.4.6)
+Also kept a versioned copy ezloan-desktop-2.5.0.exe alongside it, and left
+ezloan-desktop-login.exe (v2.4.5-only) untouched/orphaned - no longer referenced anywhere.
+
+What v2.5.0 concretely contains (all three deliverable pieces from v2.4.4/2.4.5/2.4.6, plus
+v2.4.7 diagnostics):
+  1. v2.4.4 stability baseline: no false "session expired" (재로그인) alarms, frontier
+     re-baselines correctly on restart, runs 24/7 (no idle time-window).
+  2. v2.4.5 login auto-retry: if Naver/이지론 login is briefly slow, the app retries
+     automatically every ~45s for up to ~20 min instead of giving up after ~4 tries and asking
+     the customer to manually click 시작 again.
+  3. v2.4.6 registration-speed fix (the paid "1등" upgrade itself): removed a 288KB pre-check
+     page fetch and a duplicate list fetch that OUR OWN earlier stability updates had added to
+     the new-post register path (this had slowed us from 133ms to 288ms per new post, letting
+     competitors register first); polling tightened 1.5s -> 0.8s. Net register latency ~87ms,
+     faster than the app has ever been. Live-verified 2026-07-17: banner landed at slot 1 on
+     every post it appeared on after the fix.
+  4. v2.4.7 diagnostics (already free, riding along): logs remaining paid-banner credits
+     (배너잔여) on every cycle/refusal, so a future "왜 안 올라가요" report is self-diagnosing.
+
+AUTO_UPDATE_ENABLED stays False (operator instruction, unchanged) - this is a manual delivery,
+customer must download+run the new exe themselves; it will not self-update.
