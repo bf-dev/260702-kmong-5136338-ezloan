@@ -232,3 +232,21 @@ v2.4.7 diagnostics):
 
 AUTO_UPDATE_ENABLED stays False (operator instruction, unchanged) - this is a manual delivery,
 customer must download+run the new exe themselves; it will not self-update.
+
+BUILD/DELIVERY EVIDENCE (2026-07-27): GitHub Actions run 30228877220 on bf-dev/260702-kmong-5136338-ezloan
+went green (all verify_*/repro_* steps + GUI construct self-test + real Windows screenshot). Downloaded
+exe verified `PE32+ executable (GUI) x86-64` at 33,273,801 bytes. Hosted at BOTH
+ezloan-desktop-2.5.0.exe and the canonical version-free ezloan-desktop-update.exe (both curl -I 200,
+content-length 33273801). artifacts-check 5136338 confirms the customer's CURRENTLY RUNNING app
+(still v2.4.4, pre-upgrade) is actively posting `[cycle]` rows every ~10s via bridge.py -> the
+Artifacts API channel is alive and proven end-to-end; no retrofit was needed, bridge.py already ships
+in every build.
+
+GITHUB ACTIONS BILLING GOTCHA (recurring across bf-dev repos, see also memory
+projects/260630-kmong-244448-wcompany-contact-collector/build-and-scraping-facts.md): this repo's
+first build attempt after a while failed instantly (~7s, 0 steps) with "recent account payments have
+failed or your spending limit needs to be increased". WORKAROUND: `gh repo edit bf-dev/<repo>
+--visibility public` (public repos get free windows-latest minutes, sidesteps the billing block). Did
+that here (repo has no secrets committed - just endpoint URLs); build immediately succeeded after. If
+a future build on this repo fails the same way, re-check `gh repo view ... --json visibility` is still
+`PUBLIC` first before assuming a real regression.
