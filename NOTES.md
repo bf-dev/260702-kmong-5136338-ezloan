@@ -647,3 +647,22 @@ here; do not blindly flip `AUTO_UPDATE_ENABLED` back on without addressing the t
 gaps above, and confirm on a real Windows box (not just CI's clean runner) whether Defender/
 SmartScreen is actually the blocker (e.g. check `Get-MpThreatDetection` / quarantine, or add
 code-signing) before trying again.
+
+ADDENDUM (~06:50): `version-ezloan-desktop.json` was re-pointed at 2.5.4 again (not by this
+subagent) and the customer's machine DID attempt the swap again - artifacts-check shows a
+NEW `ezloan-desktop-v2.5.4` source logging `[app_started]` + `[auto_update_disabled]` at
+06:50:18, then **nothing further** for 3+ minutes (no session_recovered/registrar_init/
+run_started/cycle) - the exact same silent-death signature as the v2.5.3 attempt, while the
+customer's other already-running copy (`ezloan-desktop-v2.5.0`, a THIRD, older version also
+apparently still running on their machine - the customer seems to have multiple exe copies/
+shortcuts) kept cycling uninterrupted throughout (#243 -> #419+). This is useful negative
+evidence: the silent-death-after-app_started symptom reproduced on a DIFFERENT version/build
+(2.5.4, not just 2.5.3), which weakens "it's something specific to the 2.5.3 code" and
+strengthens "it's the swap/fresh-launch mechanism itself" (Defender/SmartScreen on a newly
+written exe, or an antivirus real-time-scan lock on the just-copied file, are still the
+leading candidates - no code fix has touched this yet). Checked no single-instance-lock/mutex
+exists in the codebase (grepped), so "blocked by the still-running old copy" is ruled out as
+an explanation for the silent exit. This needs an actual Windows-side check (Defender
+protection history / Get-MpThreatDetection, or asking the customer directly what they saw)
+that no one has done yet - artifacts-check alone cannot see it, because the process dies
+before `updater.py`'s own diagnostics can flush.
