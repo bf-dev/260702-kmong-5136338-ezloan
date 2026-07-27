@@ -53,6 +53,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_post_absent_backoff.py
 
+      - name: Verify post_absent GIVEUP does not permanently block a later-real post (2026-07-27, post=30834 live bug)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_post_absent_giveup_then_real.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8

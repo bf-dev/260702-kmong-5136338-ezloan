@@ -91,6 +91,7 @@ def build_registrar():
     r._auth_mismatch_streak = 0
     r._post_absent_pid = None
     r._post_absent_streak = 0
+    r._post_absent_giveup = set()
     r._wait = lambda s: None
     return r
 
@@ -115,7 +116,7 @@ def one_cycle(r, frontier):
     if safe_frontier > frontier:
         frontier = safe_frontier
     for pid, precheck in ahead:
-        if pid in r.seen:
+        if pid in r.seen or pid in r._post_absent_giveup:
             continue
         exists = r._handle(pid, precheck=precheck)
         if exists and pid.isdigit() and int(pid) >= frontier:

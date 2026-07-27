@@ -454,6 +454,16 @@ class Registrar:
         # seen 처리한다(무한 정체 방지). 그 전까지는 매 사이클 재시도한다.
         self._post_absent_pid = None
         self._post_absent_streak = 0
+        # 2026-07-27 실측 버그(고객 5136338, 30834): post_absent 로 GIVEUP 한 pid 는 예전엔
+        # self.seen 에 넣었는데, self.seen 은 목록 안전망(new = [i for i in ids if i not in
+        # self.seen], 아래 poll())도 걸러내는 데 쓰는 바로 그 집합이다. 그래서 '진짜 없는 번호'로
+        # 포기한 pid 가 나중에(같은 세션 안에서, 8분 giveup 창을 넘겨) 실제로 새 글로 뜨면,
+        # 목록 안전망조차 그 pid 를 영원히 건너뛰어 절대 등록되지 않았다(라이브로 재현: 05:51
+        # giveup 한 30834 가 06:10 경 진짜 글로 등장했는데도 등록 시도가 없었음).
+        # 고쳐서, giveup 은 '적극적 프런티어-probe 재시도만' 멈추고(스팸 방지, 이게 giveup 의
+        # 원래 목적), 목록 안전망은 계속 그 pid 를 볼 수 있게 self.seen 이 아닌 별도 집합에 넣는다.
+        # 실제로 나중에 등록/판정되면 그 경로(line ~926)가 self.seen 에 정상적으로 추가한다.
+        self._post_absent_giveup = set()
         # '목록은 로그인인데 등록 API 만 404 error 로 거부'되는 상황(auth_mismatch)의 연속 횟수.
         # 세션이 살아있음이 logged_in() 로 확인됐는데도 등록만 계속 거부되면, 이건 세션 사망이
         # 아니라 계정/게시글 측 등록 불가 상태다. 조용히 초당 수십 회 재시도하며 사이트를
@@ -776,7 +786,7 @@ class Registrar:
                     if safe_frontier > frontier:
                         frontier = safe_frontier
                     for pid, precheck in ahead:
-                        if pid in self.seen:
+                        if pid in self.seen or pid in self._post_absent_giveup:
                             continue
                         # register() 가 precheck(rq_addbanner_check 결과)를 재사용하므로 이 글엔
                         # rq_addbanner 만 한 번 더 쏘면 된다 -> 경쟁사보다 먼저 상단을 잡는다.
@@ -924,6 +934,7 @@ class Registrar:
 
         if result.get("ok") or note in NON_RETRYABLE:
             self.seen.add(pid)
+            self._post_absent_giveup.discard(pid)
             self._write_seen()
 
         if result.get("ok") and result.get("rank"):
@@ -1025,14 +1036,19 @@ class Registrar:
                 force=(self._post_absent_streak <= 3 or give_up),
             )
             if give_up:
-                self.seen.add(pid)
-                self._write_seen()
+                # self.seen 이 아니라 별도 giveup 집합에 넣는다: 적극적 프런티어-probe
+                # 재시도만 멈추고, 목록 안전망(poll() 의 new = [i for i in ids if i not in
+                # self.seen])은 이 pid 를 계속 볼 수 있게 둔다. 나중에 이 번호가 진짜 새 글로
+                # 뜨면 목록 안전망이 그때 정상적으로 잡아 등록한다(2026-07-27 버그 수정, 30834
+                # 라이브 재현: 예전엔 seen 에 넣어 이 경로마저 영구히 막았다).
+                self._post_absent_giveup.add(pid)
                 self._post_absent_pid = None
                 self._post_absent_streak = 0
                 self.remote(
                     "register_post_absent_giveup",
                     f"post={pid} 연속 {config.POST_ABSENT_GIVEUP_STREAK}회 post_absent - "
-                    "진짜 존재하지 않는 번호로 보고 건너뜀(seen 처리, frontier 전진 허용).",
+                    "진짜 존재하지 않는 번호로 보고 적극 재시도는 건너뜀(frontier 전진 허용, "
+                    "단 목록 안전망은 계속 감시 - 나중에 실제로 뜨면 등록됨).",
                     force=True,
                 )
                 return True   # 포기 = 존재 불가로 확정 -> frontier 전진 허용(폭주 없이 통과).
