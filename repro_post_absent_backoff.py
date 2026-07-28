@@ -104,12 +104,15 @@ def scenario_backoff_reduces_write_load():
     """FAST_RETRY 구간을 넘겨도(계속 post_absent) WRITE 호출이 사이클 수보다 훨씬 적어야 한다."""
     ADD_CALLS["n"] = 0
     r = build_registrar()
-    live_after = config.POST_ABSENT_FAST_RETRY_CYCLES + 25  # 백오프 구간에서 뜸
+    # v2.5.5: BACKOFF_INTERVAL 이 스케일(4배)됐으므로 여기 여유값도 BACKOFF_INTERVAL 배수로
+    # 잡는다(고정 상수 25/10 이면 새 간격에서 백오프 재시도 틱을 못 맞추고 테스트가 실패한다 -
+    # 실제 코드 버그가 아니라 이 테스트 자체의 낡은 하드코딩이었음, 2026-07-28 확인).
+    live_after = config.POST_ABSENT_FAST_RETRY_CYCLES + 3 * config.POST_ABSENT_BACKOFF_INTERVAL
     r.s = BackoffFakeSession(page_live_after_cycle=live_after)
     r.seen.update(eb.list_post_ids(r.s))
     frontier = REAL_MAX + 1
     total_cycles = 0
-    for i in range(1, live_after + 10):
+    for i in range(1, live_after + 2 * config.POST_ABSENT_BACKOFF_INTERVAL + 10):
         r.s.cycle["n"] = i
         frontier = one_cycle(r, frontier)
         total_cycles = i

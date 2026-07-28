@@ -433,6 +433,10 @@ class Registrar:
         self._session_lost_streak = 0   # 연속 세션-없음 신호 카운트
         self._cycle = 0
         self._registered_total = 0
+        # v2.5.5: 무거운 목록(/rq, 309KB) fetch + 안전망/재동기화는 LIST_POLL_SECONDS 마다만
+        # 돈다(가벼운 프런티어 체크는 매 fast tick 마다). 0 으로 두면 다음 tick 이 곧바로
+        # '무거운 tick'이 되어 시작 직후 한 번은 반드시 안전망이 돈다.
+        self._last_heavy_tick = 0.0
         # 마지막으로 rq_addbanner_check 가 통과했을 때의 남은 배너 잔여 개수(amount).
         # 사이클 요약에 실어 로그로 남긴다 -> '배너 안 올라감' 진단에서 계정 배너 잔여
         # 소진 여부를 한눈에 확인(등록 거부 + 잔여 0 = 고객이 배너 상품을 충전/연장해야 함).
@@ -450,7 +454,7 @@ class Registrar:
         self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
         # post_absent 재시도 추적('체크는 open인데 페이지가 아직 안 뜬' 찰나의 경쟁, pid 는
         # 항상 현재 frontier 이므로 같은 pid 가 연속으로 재확인된다). 같은 pid 가 이 횟수 넘게
-        # 계속 post_absent 면(POLL_SECONDS 기준 수 분) 진짜로 없는 번호로 보고 그때만 포기해
+        # 계속 post_absent 면(FRONTIER_POLL_SECONDS 기준 수 분) 진짜로 없는 번호로 보고 그때만 포기해
         # seen 처리한다(무한 정체 방지). 그 전까지는 매 사이클 재시도한다.
         self._post_absent_pid = None
         self._post_absent_streak = 0
@@ -753,31 +757,11 @@ class Registrar:
                         force=True,
                     )
 
-                self._cycle += 1
-                # 0) 프런티어 자가 보정(runaway 회복): 프런티어는 '실제 최신 글 + 1'을 기준으로
-                # look-ahead 창(LOOKAHEAD)만큼만 앞서야 한다. 계정이 잠시 no_permission 상태에
-                # 빠지는 등으로 과거에 프런티어가 미존재(유령) 번호까지 폭주했다면, 재시작 없이도
-                # 여기서 실제 목록 기준으로 되돌린다. 목록의 글은 이미 seen 에 흡수되므로 되돌려도
-                # 재-add 가 나지 않고, look-ahead 가 다시 '진짜 새 글'을 즉시 잡을 수 있게 된다.
-                # (되돌리는 하한은 실제 최신글 바로 다음 번호. 그보다 낮추지 않아 옛 글 재처리 없음.)
-                # 목록은 사이클당 '한 번만' 가져온다(각 ~309KB). 예전엔 프런티어 재동기화용과
-                # 안전망용으로 목록을 두 번 받았는데(v2.4.3~), 그 여분의 왕복이 사이클을 늘려
-                # 새 글 감지·등록을 늦췄다. 같은 목록을 재동기화·안전망에 함께 쓴다.
-                ids = list_post_ids(self.s)
-                real_max = max((int(x) for x in ids if str(x).isdigit()), default=0)
-                if real_max:
-                    sane_frontier = real_max + 1
-                    # 정상 앞섬(창 크기)보다 크게 벗어났을 때만 되돌린다(정상 미세 앞섬은 유지).
-                    if frontier > sane_frontier + config.LOOKAHEAD:
-                        self.remote(
-                            "frontier_resync",
-                            f"프런티어 폭주 감지: frontier={frontier} > 실제최신({real_max})+1+창"
-                            f"({sane_frontier + config.LOOKAHEAD}). "
-                            f"실제 목록 기준 frontier={sane_frontier} 로 되돌림(옛 글 재처리 없음).",
-                            force=True,
-                        )
-                        frontier = sane_frontier
                 # 1) look-ahead: 새 글을 가장 빨리 잡아 즉시 등록(상단 1등 경쟁의 핵심 경로).
+                # v2.5.5: 이 블록은 매 fast tick(FRONTIER_POLL_SECONDS, 기본 0.2s)마다 항상
+                # 돈다 - probe_state 가 부르는 rq_addbanner_check 는 47바이트짜리 가벼운 JSON
+                # 호출이라(실측), 무거운 /rq 목록(309KB, 아래 2)과 분리해 훨씬 촘촘히 돌려도
+                # 사이트 부담이 크지 않다. 이게 새 글 감지 지연을 좁히는 핵심(평균 ~0.4s -> ~0.1s).
                 if config.LOOKAHEAD > 0:
                     ahead, safe_frontier = lookahead_ids(self.s, frontier, config.LOOKAHEAD)
                     # 프런티어는 '존재가 확인된 번호'까지만 전진시킨다. lookahead 가 돌려준
@@ -797,6 +781,39 @@ class Registrar:
                             frontier = int(pid) + 1
                         if self.should_stop():
                             break
+
+                # v2.5.5: 아래(0, 2번 + 세션 점검)는 무거운 목록(/rq, 309KB) fetch 가 필요한
+                # 작업이라 LIST_POLL_SECONDS(기본 1.0s) 마다만 얹혀서 돈다. 위 1)번 fast tick
+                # 은 이 조건과 무관하게 항상 돈다(그게 이번 튜닝의 핵심). 무거운 tick 이 아닌
+                # 사이클은 여기서 그냥 짧게 쉬고 다음 fast tick 으로 넘어간다.
+                now_ts = time.time()
+                if (now_ts - self._last_heavy_tick) < config.LIST_POLL_SECONDS:
+                    self._wait(config.FRONTIER_POLL_SECONDS)
+                    continue
+                self._last_heavy_tick = now_ts
+                self._cycle += 1
+
+                # 0) 프런티어 자가 보정(runaway 회복): 프런티어는 '실제 최신 글 + 1'을 기준으로
+                # look-ahead 창(LOOKAHEAD)만큼만 앞서야 한다. 계정이 잠시 no_permission 상태에
+                # 빠지는 등으로 과거에 프런티어가 미존재(유령) 번호까지 폭주했다면, 재시작 없이도
+                # 여기서 실제 목록 기준으로 되돌린다. 목록의 글은 이미 seen 에 흡수되므로 되돌려도
+                # 재-add 가 나지 않고, look-ahead 가 다시 '진짜 새 글'을 즉시 잡을 수 있게 된다.
+                # (되돌리는 하한은 실제 최신글 바로 다음 번호. 그보다 낮추지 않아 옛 글 재처리 없음.)
+                # 목록은 무거운 tick당 '한 번만' 가져온다(각 ~309KB, 재동기화·안전망 공용).
+                ids = list_post_ids(self.s)
+                real_max = max((int(x) for x in ids if str(x).isdigit()), default=0)
+                if real_max:
+                    sane_frontier = real_max + 1
+                    # 정상 앞섬(창 크기)보다 크게 벗어났을 때만 되돌린다(정상 미세 앞섬은 유지).
+                    if frontier > sane_frontier + config.LOOKAHEAD:
+                        self.remote(
+                            "frontier_resync",
+                            f"프런티어 폭주 감지: frontier={frontier} > 실제최신({real_max})+1+창"
+                            f"({sane_frontier + config.LOOKAHEAD}). "
+                            f"실제 목록 기준 frontier={sane_frontier} 로 되돌림(옛 글 재처리 없음).",
+                            force=True,
+                        )
+                        frontier = sane_frontier
                 # 2) listing safety net (위에서 이미 받은 목록 재사용)
                 new = [i for i in ids if i not in self.seen]
                 # 사이클 진단: 목록 수 / 새 글 수 / 세션-없음 연속 카운트 (10초 디바운스)
@@ -893,7 +910,9 @@ class Registrar:
                     self.log("로그인이 만료되었습니다. 다시 로그인해 주세요.")
                     self.remote("session_expired", "loop 예외 후 세션 무효 확인", force=True)
                     return
-            self._wait(config.POLL_SECONDS)
+            # v2.5.5: 매 tick(=새 글 감지 지연 상한)은 이제 FRONTIER_POLL_SECONDS(0.2s) 기준.
+            # 무거운 목록 fetch(LIST_POLL_SECONDS)는 위 루프 안에서 별도 타이머로 게이팅된다.
+            self._wait(config.FRONTIER_POLL_SECONDS)
         self.remote("run_stopped", "폴링 루프 중지", force=True)
 
     def _handle(self, pid, precheck=None):

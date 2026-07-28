@@ -58,6 +58,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_post_absent_giveup_then_real.py
 
+      - name: Verify fast/heavy tick split cuts detection latency without losing new posts (2026-07-28, v2.5.5)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_frontier_fast_tick.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8
