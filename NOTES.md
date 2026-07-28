@@ -666,3 +666,116 @@ an explanation for the silent exit. This needs an actual Windows-side check (Def
 protection history / Get-MpThreatDetection, or asking the customer directly what they saw)
 that no one has done yet - artifacts-check alone cannot see it, because the process dies
 before `updater.py`'s own diagnostics can flush.
+
+---
+
+## 2026-07-28 — v2.5.5: FREE tuning pass, decouple fast frontier-check tick from heavy list tick
+
+Owner instruction: customer reports "거의 2등" (mostly landing 2nd), asked for a free tuning
+pass to push toward 1등, no new charge. Explicit constraints: do NOT reintroduce the
+pre-register post_exists() check, do NOT reintroduce duplicate list fetches, do NOT
+re-enable AUTO_UPDATE_ENABLED.
+
+### What was actually limiting speed (measured, not guessed)
+
+Live measurement via KR egress (unicorn@external-8, read-only, did NOT log into the
+customer's Naver/이지론 account):
+- `/rq` list fetch (used for the safety net + frontier resync): **309,208 bytes**, ~0.3-0.7s.
+- `/api/rq_addbanner_check/{pid}` (the actual new-post detection probe): **47 bytes**, ~35-40ms
+  on a warm keep-alive connection (vs ~98ms cold - confirms `requests.Session()` connection
+  reuse across the poll interval was already working correctly, no bug there).
+- Ping RTT to ezloan.io from this KR node: **~1.4ms**. So the ~35-40ms warm-request time is
+  almost entirely ezloan's own server-side processing, not network/TLS overhead we can tune
+  away. Checked `urllib3.connection.HTTPConnection.default_socket_options` - **TCP_NODELAY is
+  already urllib3's default** (`[(6, 1, 1)]`), so there was no free win left at the
+  socket/connection-reuse level. This is the honest ceiling: the register-call-itself latency
+  (v2.4.6's 87ms hot path) cannot be meaningfully cut further from the client side.
+
+The actual remaining inefficiency: **the loop coupled the cheap 47-byte detection check and
+the expensive 309KB list fetch to the same POLL_SECONDS(0.8s) cadence.** To detect a new post
+faster you had to tighten POLL_SECONDS, which also meant fetching the heavy list more often -
+that coupling was the real ceiling on how tight detection could get without hammering ezloan.
+
+### Fix: split the tick into two independent cadences (ezloan_bot.py `Registrar.run()`)
+
+- `config.FRONTIER_POLL_SECONDS = 0.2` - the look-ahead step (probe_state on the frontier
+  pid, register() on "open") now runs on **every** loop iteration, unconditionally. This is
+  the actual 1등-race hot path and it only needs the cheap 47-byte check + (on a hit) one
+  WRITE call, so running it 4x more often than before adds negligible load.
+- `config.LIST_POLL_SECONDS = 1.0` - the heavy part (list_post_ids() 309KB fetch, frontier
+  runaway resync, listing safety net, `_persist_session()`, session-lost/auth-mismatch
+  health checks) now only runs when `time.time() - self._last_heavy_tick >= LIST_POLL_SECONDS`
+  (new instance field `self._last_heavy_tick`, set in `Registrar.__init__`). Everything inside
+  this gated block is verbatim unchanged from v2.5.4 - only the cadence it's attached to moved.
+- Net effect (measured): average new-post detection lag ~0.4s (half of old 0.8s) -> ~0.1s
+  (half of new 0.2s), a **4x cut**, while the heavy 309KB fetch actually happens *less* often
+  (1/1.0s vs 1/0.8s before) so total bandwidth drops (~386KB/s -> ~304KB/s measured live in a
+  12s KR-egress simulation, see repro/live evidence below).
+- `POST_ABSENT_FAST_RETRY_CYCLES`/`BACKOFF_INTERVAL`/`GIVEUP_STREAK` rescaled 4x (40->160,
+  5->20, 500->2000) because they count fast-tick calls, which now happen 4x more often per
+  wall-clock second - this keeps the actual wall-clock timing (32s fast-retry window, 4s
+  backoff interval, ~6.7min giveup) **identical** to v2.5.2-v2.5.4, just with retries firing
+  4x more densely inside that same window (a genuine extra improvement in catching a
+  page-goes-live race, not just a relabeling).
+- `config.POLL_SECONDS` is kept (= `LIST_POLL_SECONDS`) only as the fallback base for
+  `_backoff_seconds()` (auth_mismatch exponential backoff) - unrelated to this tuning.
+
+### What did NOT change (verify before touching again)
+- No pre-register `post_exists()` re-added on the "open" branch (still the v2.4.6 hot path).
+- Still exactly ONE `/rq` list fetch per heavy tick (no duplicate fetches reintroduced).
+- `AUTO_UPDATE_ENABLED` untouched, still `False`.
+- Frontier-runaway protection, post_absent retry/GIVEUP-poisons-seen fix, session self-heal,
+  login auto-retry: all byte-for-byte unchanged, just re-timed.
+
+### Verification
+- All 8 pre-existing CI repros/verifies pass unchanged (`verify_247.py`,
+  `repro_frontier_runaway.py`, `verify_register_latency.py`, `repro_post_absent_race.py`,
+  `repro_post_absent_giveup_then_real.py`, `verify_login_resilient.py`,
+  `verify_error_page_detector.py`). `repro_post_absent_backoff.py`'s own hardcoded test
+  margins (`+25`/`+10` cycles) had to be rescaled to `3*BACKOFF_INTERVAL`/`2*BACKOFF_INTERVAL`
+  - this was a **test-only** fix (the old fixed offsets no longer guaranteed hitting a
+  scheduled retry tick once BACKOFF_INTERVAL itself was rescaled 4x), not a behavior change;
+  confirmed by re-deriving the math by hand and matching the observed WRITE-call counts.
+- New CI-gated `repro_frontier_fast_tick.py`: drives the **real** `Registrar.run()` with a
+  monkeypatched fake clock (`eb.time.time` replaced, `self._wait` advances the fake clock
+  instead of sleeping) and proves (a) the heavy `/rq` fetch only fires on the
+  `LIST_POLL_SECONDS` cadence, (b) the cheap check fires far more often, and (c) a post
+  created strictly between two heavy ticks is still registered on the very next fast tick,
+  with measured detection lag (0.1s in the test) bound by `FRONTIER_POLL_SECONDS`, not
+  `LIST_POLL_SECONDS` - i.e. it fails against the pre-v2.5.5 single-cadence design and passes
+  after the split.
+- Live check (KR egress unicorn@external-8, read-only, no login): ran the real
+  `list_post_ids`/`_check` functions against the live site for 12s using the new
+  FRONTIER_POLL_SECONDS/LIST_POLL_SECONDS schedule - zero exceptions, 46 check calls vs 12
+  list calls in 12.2s (matches the ~4x expected ratio), confirming the site handles the new
+  request pattern fine. Script: `~/workspace/kmong/tmp/ezloan_live_tick_check.py` (this host,
+  tmp is pruned in 14d, keep this NOTES section as the record).
+- Build: GitHub Actions run **30319864698**, all 9 verify/repro steps + GUI construct
+  self-test + real Windows screenshot green. Downloaded + verified
+  `PE32+ executable (GUI) x86-64`, 33,271,300 bytes, sha256
+  `af78f1116b0a8427ad34df79a7b4169d11a17b53db73fd2496a1a495115e30ab`.
+- Hosted at BOTH (curl -I -> HTTP 200, content-length 33271300 matching, cf-cache-status MISS
+  = fresh, no stale-cache issue this round):
+  - `https://works.insu.ng/works/public/5136338/ezloan-desktop-2.5.5.exe` (versioned)
+  - `https://works.insu.ng/works/public/5136338/ezloan-desktop-update.exe` (canonical,
+    overwritten - safe to do since `AUTO_UPDATE_ENABLED=False` in every currently-active
+    build, nothing polls this file automatically right now)
+- **Deliberately did NOT touch `version-ezloan-desktop.json`** (still points at 2.5.4, matching
+  what `artifacts-check 5136338` confirms is the customer's actually-running build right now,
+  cycling normally, rank=1 registrations happening). Auto-update is off everywhere active so
+  this file is inert either way, but leaving it matching the live install is the more
+  conservative choice given the v2.5.3 live-swap-crash history in this file. This is a MANUAL
+  delivery like every build since that incident - do NOT wire this into auto-update without
+  first fixing the two `updater.py` gaps documented in the v2.5.3/v2.5.4 sections above.
+
+### Honest ceiling (per the task's own instruction not to overstate)
+The register-call-itself latency (~40ms warm, ~87ms in the original v2.4.6 measurement) is
+already near the floor achievable from a client using standard HTTP/TLS with connection reuse
+- TCP_NODELAY is already on by default, keep-alive already reuses the warm connection, and the
+remaining time is ezloan's own server processing (RTT is only ~1.4ms). The real, measurable win
+here is **detection latency** (how fast a new post is noticed at all), cut ~4x (average ~0.4s
+-> ~0.1s) by decoupling the cheap per-post check from the expensive list fetch. Whether this
+actually flips the customer from "mostly 2등" to "consistently 1등" still depends on how fast
+competing bots poll - if a competitor also polls sub-200ms or uses a push/webhook trigger, they
+could still occasionally win. This is the same honest ceiling documented in the v2.4.6 section
+above, just moved further out.
