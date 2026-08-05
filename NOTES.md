@@ -933,3 +933,40 @@ are OLDER than some threshold, or register the newest 1-2 list entries on rebase
 Built on GitHub Actions `windows-latest` from branch `feat/v2.6.0-existence-gated-hotpath`
 (workflow_dispatch). AUTO_UPDATE_ENABLED still False; `version-ezloan-desktop.json` deliberately
 NOT touched (v2.5.3 live-swap-crash history). Delivery is a manual link, owner-gated.
+
+### Live confirmation of the treadmill, captured while building v2.6.0 (2026-08-05)
+
+The customer's v2.5.5 install did this in the 3.5 hours after registering post 31244, with
+ezloan publishing NO new post in that window:
+
+```
+04:51:30 giveup post=31245   05:01:20 giveup 31246   05:11:16 giveup 31247
+05:21:09 giveup 31248        05:31:08 giveup 31249   (frontier now 31250, still spamming writes)
+```
+
+ezloan's real newest post was still 31244 the whole time. So the frontier had walked past
+31245-31249, all five are in `_post_absent_giveup`, and the id the NEXT real post will get is
+almost certainly 31245 - a number the fast path is no longer allowed to touch. That post would
+have been registered only by the 1.0s / 309KB list safety net. This is the exact mechanism that
+produced the 02:43 registration of 31238 earlier the same day.
+
+### Things that were measured and deliberately NOT done
+
+- **Staggered / overlapping pollers.** Probe RTT is p50 48-52ms and the tick is 150ms, so two
+  pollers offset by 75ms would cut mean detection from 75ms to ~37ms, i.e. save ~37ms for double
+  the request rate (40 req/s sustained). Not worth it next to the 1.3-5.6 SECONDS the existence
+  gate already recovers. Revisit only if a competitor is measurably inside 150ms.
+- **Tightening `FRONTIER_POLL_SECONDS` below 0.15.** 0.10 works fine on the wire (measured
+  20 req/s clean) but buys 25ms of mean detection for +50% load. Same reasoning.
+- **Faster transport.** Connection reuse was already correct (warm p50 46.8ms vs cold ~98ms),
+  urllib3 sets TCP_NODELAY by default, ping RTT from a KR host is 1.4ms. The remaining ~45ms is
+  ezloan's own server time. There is nothing left at the socket/TLS layer.
+- **Streaming the probe and aborting after the first bytes.** Tried and rejected: `iter_content`
+  on a gzip response gives 1 byte at a time, and closing early kills keep-alive, so it measured
+  WORSE (p50 70.6ms, p99 2482ms) than just reading the whole 353-byte / gzipped-293KB body
+  (p50 46.8 / 72.9ms).
+- **Firing `rq_addbanner` without the check (task question 5).** Not needed and not done. The
+  check now runs in PARALLEL with the existence probe in the same tick, so it costs zero extra
+  wall-clock and register() still reuses it as `precheck`. The v2.5.0/v2.5.1 blacklist regression
+  is structurally impossible now anyway: the write only fires after the page is proven live, so
+  `post_absent` is no longer the default state of the loop.
