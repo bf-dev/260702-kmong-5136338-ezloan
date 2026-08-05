@@ -779,3 +779,157 @@ actually flips the customer from "mostly 2등" to "consistently 1등" still depe
 competing bots poll - if a competitor also polls sub-200ms or uses a push/webhook trigger, they
 could still occasionally win. This is the same honest ceiling documented in the v2.4.6 section
 above, just moved further out.
+
+---
+
+## 2026-08-05 — v2.6.0: the real bottleneck was NOT the poll interval. It was that the app
+## used the WRITE endpoint as its new-post detector, so detection was throttled to 1.4-5.7s.
+
+Owner task: beat a specific competitor bot (옥자대부) to slot 1. Constraints unchanged:
+AUTO_UPDATE stays OFF, manual delivery, do not touch the customer's live session/credits.
+
+### Which directory is the real source
+`projects/260702-kmong-5136338-ezloan` is the ONLY real source (matches live v2.5.5 log tags,
+has the git history + CI). `projects/260703-kmong-5136338-ezloan` is an EMPTY stub: it contains
+`metadata.json` and nothing else. Do not look there again.
+
+### The measurement that mattered (live customer logs, artifacts DB, 2026-08-05)
+
+The previous tuning passes (v2.4.6, v2.5.5) all assumed detection latency == poll interval.
+That was wrong, and the reason is a property of ezloan's API that IS documented above but was
+never followed to its conclusion:
+
+  **`/api/rq_addbanner_check/{pid}` checks the ACCOUNT, not the POST. It returns
+  `result:true` for a post id that does not exist yet.**
+
+So `probe_state()` returns "open" for the frontier id at every single tick, forever, whether or
+not a post exists there. The only thing that can tell the app "the post is live now" is the
+WRITE (`rq_addbanner`) coming back with something other than `404 error`. The app was therefore
+using a WRITE as its detector, and a WRITE cannot be fired every 200ms, so v2.5.2 throttled it:
+
+  - `POST_ABSENT_FAST_RETRY_CYCLES=160`  -> WRITE every tick for the first ~32s
+  - `POST_ABSENT_BACKOFF_INTERVAL=20`    -> after that, WRITE on 1 tick in 20
+  - `POST_ABSENT_GIVEUP_STREAK=2000`     -> after ~9.7 min, give up and walk the frontier past it
+
+Measured tick was 287ms (200ms sleep + ~85ms request), so **once past the first 32 seconds the
+app only asked "is the post live?" every 5.7 seconds.** New posts arrive 7-80 min apart for this
+customer, so the steady state is ALWAYS past the 32s window. Live proof, post 31244:
+
+```
+04:40:07 [register_post_absent] post=31244 ... 연속1041회
+...      (streak climbs 40 per ~11.4s = 285ms/tick, WRITE only on streak%20==0)
+04:41:28 [register_post_absent] post=31244 ... 연속1321회
+04:41:40 [registered] post=31244 rank=미확인 msg=success
+```
+
+Worse: after the ~9.7 min giveup the frontier WALKS PAST the id that the next real post will
+actually get, and that post is then only reachable via the 1.0s / 309KB list safety net.
+Live proof (2026-08-05): giveup fired on 31238, 31239, 31240, 31241, 31242, 31243 in sequence
+(00:46, 00:55, 01:05, 01:15, 01:25, 01:35), frontier resynced back, walked again. Post 31238
+was finally registered at 02:43:29 by the list safety net, not by the frontier path at all.
+Same treadmill visible all through 2026-08-02 (31136..31160, three `frontier_resync` events).
+
+Cost of that treadmill: ~15,000 `rq_addbanner` WRITE calls per day against ezloan for ~40 real
+registrations.
+
+### The fix (v2.6.0): detect with a READ, write only once existence is proven
+
+Live-verified on ezloan.io through KR egress `unicorn@external-8` (read-only, unauthenticated,
+the customer's session and 배너잔여 were never touched):
+
+```
+GET /rq/31244  (real post)      -> HTTP 200, 293,249 bytes, page markers present
+GET /rq/31246  (not yet a post) -> HTTP 200,     353 bytes, "삭제되었거나 존재하지 않은 문의입니다"
+```
+
+Both are 200, so status code is useless; size + marker is definitive. It works WITHOUT login
+(the existing `_POST_PAGE_MARKERS` are present on the anonymous page too: 배너 등록을 눌러 주세요
+x10, js-memberConfirmView x11). HEAD is useless here (HTTP/2 + `vary: Accept-Encoding`, no
+`content-length`); `Range:` is ignored (returns the full 200).
+
+New code in `ezloan_bot.py`:
+- `new_probe_session()` - dedicated UNAUTHENTICATED session for existence checks.
+- `post_live(s, pid)` - True / False / None(unknown). Never optimistically True.
+- `Registrar._scan_frontier(frontier, width)` - fires `post_live` on `[frontier .. frontier+width)`
+  AND `rq_addbanner_check(frontier)` on the AUTHED session, all in parallel on a
+  `ThreadPoolExecutor`. Wall-clock cost of the tick is ONE round trip, not N.
+- `Registrar._fast_sleep(tick_started)` - absolute-deadline scheduling, so the tick period is
+  the configured value instead of (sleep + request).
+- `Registrar.close()` - shuts the pool/session down; `app.py` calls it in its `finally`.
+- The heavy tick now refreshes `배너잔여`/session-loss streak from the parallel check result
+  (previously those rode on the register() result, which now almost never runs).
+
+`config.py`: `FRONTIER_POLL_SECONDS 0.2 -> 0.15`, new `PROBE_WINDOW = 2`,
+`POST_ABSENT_*` rescaled to the new tick so the wall-clock 32s / 4s / ~9.7min windows are
+unchanged (they are now near-dead code: post_absent can only happen if the page IS live and the
+write still 404s).
+
+### THE PHP SESSION-LOCK TRAP (do not undo this)
+
+The probe session **blocks cookies** (`DefaultCookiePolicy(allowed_domains=[])`). This is a
+SPEED fix, not hygiene. With cookies on, both requests in the probe window carry the same
+`ezloan_sess`, and ezloan (PHP) serialises them on the session file lock, so a parallel window
+costs 3x. Measured live:
+
+```
+win=2 shared-session  cookies ON       scan p50 = 148.6ms
+win=2 shared-session  cookies BLOCKED  scan p50 =  50.4ms
+win=2 separate-sessions cookies ON     scan p50 =  49.8ms
+win=3 shared-session  cookies BLOCKED  scan p50 =  53.0ms
+```
+
+If anyone ever "fixes" the probe session to keep cookies, the window silently triples in cost.
+
+### Live numbers (KR egress unicorn@external-8, read-only)
+
+```
+/rq/{missing} warm keep-alive, full read      p50  46.8ms  p90  50.2ms
+/rq/{real post} 293KB (gzip on the wire)      p50  72.9ms
+stream+abort variant (rejected, worse)        p50  70.6ms, p99 2482ms
+rq_addbanner_check alone                      p50  41.0ms
+10 req/s x 30s                                301/301 HTTP 200, no degradation, no 429/403
+v2.6.0 shape (win=2 + check, tick 0.15s)      tick p50 150.1ms, scan p50 50.4ms, ~20 req/s
+```
+
+Bandwidth to ezloan is essentially unchanged (~309KB/s, still dominated by the 1/s list fetch);
+request count goes ~4.7/s -> ~20/s of tiny responses, and WRITE calls drop ~15,000/day -> ~40/day.
+
+### Before/after, end to end (post goes live -> rq_addbanner leaves the machine)
+
+| | v2.5.5 | v2.6.0 |
+|---|---|---|
+| tick period (live measured) | 287ms (200 sleep + 85 req) | 150ms (absolute schedule) |
+| detector | the WRITE, throttled 1-in-20 ticks | a 353-byte READ, every tick |
+| lag, steady state | 1.4s - 5.7s (CI repro measured 1.400s) | 0.150s (CI repro) |
+| lag when frontier already gave up | list safety net only, 1.0s + 309KB fetch | n/a, giveup never fires |
+| WRITEs while waiting for a post | 165 per 54s of waiting | 0 |
+
+CI gate: `repro_steady_state_detect_lag.py` drives the REAL `Registrar.run()` with a fake clock,
+puts the post live in the MIDDLE of a backoff interval (aligning it to a backoff tick makes the
+old code look fine by luck - do not "simplify" that), and asserts lag <= 2 ticks and zero writes
+before existence is proven. Verified it FAILS on v2.5.5 (`git worktree add --detach /tmp/x HEAD~1`)
+with `lag 1.400s` + `165 writes`, and PASSES on v2.6.0 with `0.150s` + `0 writes`.
+`repro_frontier_fast_tick.py` needed its `build_registrar()` extended with `probe`,
+`_probe_pool` (an inline non-threaded pool for determinism) and `_last_check`.
+
+### Honest state of the race (measured, 2026-08-05)
+
+Scanned posts 31150-31244 live: **더원대부 is slot 1 on 72 of the 72 posts where it appears, and
+was never below slot 1.** `옥자대부` does not appear on ANY of those 82 posts - the competitor is
+not currently advertising. So the "consistently 2등" the customer reported is NOT reproducible
+right now, and the v2.6.0 win cannot be demonstrated as a rank change today. What IS proven is
+that the app was leaving 1.4-5.7 seconds on the table in the exact moment of the race, which is
+an enormous margin against any competitor that polls at all quickly. Banner order is confirmed
+FCFS (advertisers who appear on MORE posts than us, e.g. 서일대부 82/82, are still always below us).
+
+10 of the 82 posts have no 더원대부 banner: 31165-31174 (nine consecutive) and 31203.
+**OPEN ITEM, not fixed in v2.6.0:** on restart, `run()` does `baseline = list_post_ids()` and
+absorbs the whole current list into `seen`, so any post published while the app was restarting is
+permanently skipped. The 2026-08-02 logs show restarts (cycle counter resets #283117 -> #23117,
+`session_recovered` at 04:00) around that id range. Worth fixing separately: only absorb ids that
+are OLDER than some threshold, or register the newest 1-2 list entries on rebaseline.
+
+### Build / hosting
+Built on GitHub Actions `windows-latest` from branch `feat/v2.6.0-existence-gated-hotpath`
+(workflow_dispatch). AUTO_UPDATE_ENABLED still False; `version-ezloan-desktop.json` deliberately
+NOT touched (v2.5.3 live-swap-crash history). Delivery is a manual link, owner-gated.
