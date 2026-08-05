@@ -52,6 +52,27 @@ class FakeResp:
         return self._js
 
 
+class _InlineFuture:
+    def __init__(self, fn, args):
+        try:
+            self._v, self._e = fn(*args), None
+        except Exception as e:   # noqa: BLE001 - 테스트 하네스
+            self._v, self._e = None, e
+
+    def result(self, timeout=None):
+        if self._e:
+            raise self._e
+        return self._v
+
+
+class InlinePool:
+    """v2.6.0 의 _probe_pool 대역(테스트용). 진짜 스레드를 쓰지 않고 즉시 실행해서
+    가짜 시계(FAKE_NOW) 기반 검증이 결정적으로 재현되게 한다."""
+
+    def submit(self, fn, *args):
+        return _InlineFuture(fn, args)
+
+
 class FakeSession:
     def __init__(self):
         self.headers = {}
@@ -86,6 +107,10 @@ class FakeSession:
 def build_registrar():
     r = eb.Registrar.__new__(eb.Registrar)
     r.s = FakeSession()
+    # v2.6.0: 존재 확인 전용(비로그인) 세션 + 병렬 발사 풀 + 같은 tick 의 check 캐시.
+    r.probe = FakeSession()
+    r._probe_pool = InlinePool()
+    r._last_check = None
     r._cookies_raw = []
     r._diag_sent = False
     r.log = lambda *a, **k: None

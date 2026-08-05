@@ -13,6 +13,7 @@
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,6 +54,11 @@ _RQ_LINK_RE = re.compile(r'/rq/(\d+)(?:["\'/?#]|$)')
 # 못하고 아래 글-존재 마커도 없으면 그 번호의 글은 '아직 없음'으로 확정한다.
 _POST_PAGE_MIN_BYTES = 1000
 _POST_PAGE_MARKERS = ("배너 등록을 눌러 주세요", "js-memberConfirmView", "rq_addbanner")
+# 실측(2026-08-05, KR egress unicorn@external-8, 비로그인): 존재하지 않는 글 번호의
+# /rq/{id} 는 아래 문구가 든 353바이트짜리 alert 스크립트 한 조각만 돌려준다(HTTP 200).
+# 실제 글은 293,249바이트 전체 페이지 + 위 마커들. 상태코드는 둘 다 200 이므로
+# 크기/마커로만 가를 수 있다. 로그인 여부와 무관하게 동일하게 판별된다(실측 확인).
+_POST_MISSING_MARKER = "존재하지 않은"
 NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission",
                  # 글은 실재하지만 이 회원 배너가 이미 있거나(재등록 불가) 지금 계정 상태로
                  # 등록 대상이 아님. rq_addbanner 가 result:false('404 error'/'no permission')
@@ -220,6 +226,59 @@ def post_exists(s, pid):
         return False
     body = r.text or ""
     if len(body) < _POST_PAGE_MIN_BYTES:
+        return False
+    return any(m in body for m in _POST_PAGE_MARKERS)
+
+
+def new_probe_session():
+    """글 존재 확인 전용(비로그인) 세션.
+
+    고객의 로그인 세션(self.s)과 절대 쿠키 항아리를 섞지 않는다: /rq/{id} 응답은 매번
+    Set-Cookie 로 새 ezloan_sess/csrf_cookie_ezloan 을 내려주므로, 같은 세션으로 이걸
+    초당 여러 번 때리면 로그인 쿠키를 계속 회전/오염시킬 위험이 있다(2026-07-03 의
+    '중복 ezloan_sess -> 404 error 무한루프' 사고와 같은 계열). 존재 확인은 로그인
+    없이도 완전히 동일하게 판별된다(2026-08-05 실측, KR egress 로 확인).
+
+    keep-alive 를 유지하는 게 핵심이다(실측: 웜 커넥션 p50 46.8ms vs 콜드 ~98ms).
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        "Referer": config.RQ_URL,
+        # 미존재 페이지는 353바이트뿐이라 gzip 이 있으나 없으나 비슷하지만, 실제 글이
+        # 뜨는 '그 순간'의 293KB 를 압축해 받아 오면 고객 가정용 회선에서 수백 ms 를 아낀다.
+        "Accept-Encoding": "gzip, deflate",
+    })
+    return s
+
+
+def post_live(s, pid):
+    """이 글 번호의 페이지가 '실제로 떴는지' 확인. True/False/None(판정 불가).
+
+    v2.6.0 핫패스의 심장. 이전(v2.4.6~v2.5.5)에는 새 글 감지를 rq_addbanner_check
+    (result:true) 로 했는데, 실측상 그 엔드포인트는 계정 엔타이틀먼트만 보고 '글 존재'는
+    전혀 보지 않는다 - 아직 생기지도 않은 미래 번호에도 result:true 를 준다. 그래서 실제
+    감지는 쓰기 엔드포인트(rq_addbanner)의 '404 error' 여부로만 가능했고, 쓰기를 매 tick
+    쏠 수는 없으니 backoff(20tick=~5.7s) + giveup 으로 throttle 할 수밖에 없었다. 그
+    throttle 이 곧 등록 지연이었다(라이브 실측: 새 글이 떠도 최대 5.7s 뒤에야 쓰기 발사).
+
+    이 함수는 '읽기'만으로 존재를 확정한다(실측 353바이트 vs 293KB). 그래서 쓰기는 글이
+    실제로 뜬 것이 확인된 뒤 딱 한 번만 나가고, 감지 주기는 마음껏 좁힐 수 있다.
+
+    반환값 None 은 '네트워크 오류로 판정 못 함'이다. 절대 True 로 낙관하지 않는다
+    (낙관하면 유령 번호에 쓰기를 쏘던 예전 동작으로 되돌아간다).
+    """
+    try:
+        r = s.get(f"{config.BASE_URL}/rq/{pid}", timeout=8, allow_redirects=True)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return False
+    body = r.text or ""
+    if len(body) < _POST_PAGE_MIN_BYTES:
+        return False
+    if _POST_MISSING_MARKER in body and not any(m in body for m in _POST_PAGE_MARKERS):
         return False
     return any(m in body for m in _POST_PAGE_MARKERS)
 
@@ -418,6 +477,12 @@ class Registrar:
     def __init__(self, cookies, log=print, remote=None, should_stop=None,
                  seen_path=None, relogin=None):
         self.s = session_from_cookies(cookies)
+        # v2.6.0: 글 존재 확인 전용(비로그인) 세션 + 그 확인들을 '동시에' 쏘는 작은 풀.
+        # 로그인 세션과 분리하는 이유는 new_probe_session() 주석 참고.
+        self.probe = new_probe_session()
+        self._probe_pool = ThreadPoolExecutor(
+            max_workers=max(2, int(getattr(config, "LOOKAHEAD", 6)) + 1),
+            thread_name_prefix="ezloan-probe")
         self._cookies_raw = cookies or []
         self._diag_sent = False   # auth_diag_dump 는 실행당 1회만
         self.log = log
@@ -437,6 +502,10 @@ class Registrar:
         # 돈다(가벼운 프런티어 체크는 매 fast tick 마다). 0 으로 두면 다음 tick 이 곧바로
         # '무거운 tick'이 되어 시작 직후 한 번은 반드시 안전망이 돈다.
         self._last_heavy_tick = 0.0
+        # v2.6.0: 매 fast tick 에 존재 확인과 '병렬로' 받아둔 rq_addbanner_check 결과
+        # (code, data). 글이 뜬 순간 그대로 precheck 로 재사용하고(감지->발사 1왕복),
+        # 무거운 tick 마다 세션 사망 신호/배너잔여(amount)를 여기서 갱신한다.
+        self._last_check = None
         # 마지막으로 rq_addbanner_check 가 통과했을 때의 남은 배너 잔여 개수(amount).
         # 사이클 요약에 실어 로그로 남긴다 -> '배너 안 올라감' 진단에서 계정 배너 잔여
         # 소진 여부를 한눈에 확인(등록 거부 + 잔여 0 = 고객이 배너 상품을 충전/연장해야 함).
@@ -656,6 +725,58 @@ class Registrar:
         except Exception:
             return False
 
+    def _fast_sleep(self, tick_started):
+        """이 tick 이 '시작된 시각' 기준으로 다음 tick 까지 남은 시간만 돌려준다.
+
+        예전(v2.5.5까지)에는 작업을 끝낸 뒤 FRONTIER_POLL_SECONDS 만큼 통으로 쉬었다.
+        그래서 실제 tick 간격 = sleep + HTTP 왕복이 되어, 설정값이 0.2s 인데 고객 PC 라이브
+        실측은 279~406ms(중앙값 287ms)까지 벌어졌다 - 요청에 걸린 시간이 그대로 '새 글 감지
+        지연 상한'에 얹힌 셈이다. 절대 시각 기준으로 남은 만큼만 쉬면 tick 간격이 설정값에
+        붙고(요청 시간은 그 안에 흡수), 설정값보다 오래 걸린 tick 은 쉬지 않고 바로 다음
+        tick 으로 넘어간다.
+        """
+        remain = config.FRONTIER_POLL_SECONDS - (time.time() - tick_started)
+        return remain if remain > 0 else 0.0
+
+    def _safe_check(self, pid):
+        """rq_addbanner_check 를 한 번 쳐서 (code, data) 를 돌려준다. 실패하면 None."""
+        try:
+            code, data = _check(self.s, str(pid))
+        except Exception:
+            return None
+        return (code, data) if code == 200 else None
+
+    def _scan_frontier(self, frontier, width):
+        """프런티어 앞 width 개 글번호의 '실존'을 동시에 확인한다(v2.6.0 핫패스).
+
+        반환: (live_pids, precheck)
+          live_pids : 실제로 페이지가 뜬 글 번호 목록(오름차순)
+          precheck  : 같은 tick 에 병렬로 받아온 frontier 의 rq_addbanner_check 결과
+                      (code, data) 또는 None
+
+        핵심은 '병렬'이다. 존재 확인(비로그인 /rq/{id}, 353바이트)과 등록 자격 확인
+        (로그인 /api/rq_addbanner_check, 47바이트)을 같은 tick 에 동시에 쏘므로 이 tick 의
+        벽시계 비용은 둘 중 느린 쪽 1왕복뿐이다(직렬이면 2왕복). 그래서 글이 뜬 것이
+        확인되는 순간, 이미 손에 든 precheck 를 그대로 재사용해 rq_addbanner 1왕복만
+        더 쏘면 등록이 끝난다(감지 -> 발사 = 정확히 1왕복).
+        """
+        pids = [frontier + i for i in range(max(1, int(width)))]
+        fut_check = self._probe_pool.submit(self._safe_check, frontier)
+        futs = [(p, self._probe_pool.submit(post_live, self.probe, str(p))) for p in pids]
+        live = []
+        for p, f in futs:
+            try:
+                ok = f.result(timeout=20)
+            except Exception:
+                ok = None
+            if ok:
+                live.append(p)
+        try:
+            precheck = fut_check.result(timeout=20)
+        except Exception:
+            precheck = None
+        return live, precheck
+
     def _backoff_seconds(self):
         """auth_mismatch 가 이어질수록 폴링 간격을 늘려 사이트 부담/차단 위험을 줄인다.
 
@@ -736,6 +857,9 @@ class Registrar:
         )
 
         while not self.should_stop():
+            # v2.6.0: tick 간격을 '작업 후 고정 sleep'이 아니라 '이 tick 시작 시각 기준
+            # 절대 스케줄'로 잡는다. 아래 _fast_sleep() 주석 참고(라이브 실측 287ms -> 설정값).
+            tick_started = time.time()
             try:
                 # 운영 시간대(기본 08:00~23:00 KST) 밖이면 등록을 멈추고 대기한다.
                 # 창은 살아있고, 시간대 재진입 후 세션을 자가 치유한 뒤 baseline 을 다시 잡아
@@ -758,25 +882,35 @@ class Registrar:
                     )
 
                 # 1) look-ahead: 새 글을 가장 빨리 잡아 즉시 등록(상단 1등 경쟁의 핵심 경로).
-                # v2.5.5: 이 블록은 매 fast tick(FRONTIER_POLL_SECONDS, 기본 0.2s)마다 항상
-                # 돈다 - probe_state 가 부르는 rq_addbanner_check 는 47바이트짜리 가벼운 JSON
-                # 호출이라(실측), 무거운 /rq 목록(309KB, 아래 2)과 분리해 훨씬 촘촘히 돌려도
-                # 사이트 부담이 크지 않다. 이게 새 글 감지 지연을 좁히는 핵심(평균 ~0.4s -> ~0.1s).
+                # v2.6.0: 감지 기준을 '쓰기(rq_addbanner)의 실패 여부'에서 '읽기(/rq/{id})의
+                # 실존 여부'로 바꾼다. rq_addbanner_check 는 계정 자격만 보고 글 존재는 전혀
+                # 보지 않아(미래 번호에도 result:true) 감지에 쓸 수 없었고, 그래서 v2.5.x 는
+                # 쓰기 엔드포인트를 감지기로 쓰다가 backoff(20tick≈5.7s)/giveup 으로 throttle
+                # 되어 '글이 떠도 최대 5.7초 뒤에야 발사'하는 상태였다(라이브 실측). 이제
+                # 존재 확인은 353바이트짜리 읽기이므로 매 tick 마음껏 돌릴 수 있고, 쓰기는
+                # 글이 뜬 것이 확인된 뒤 정확히 한 번만 나간다.
+                now_ts = tick_started
+                heavy_due = (now_ts - self._last_heavy_tick) >= config.LIST_POLL_SECONDS
                 if config.LOOKAHEAD > 0:
-                    ahead, safe_frontier = lookahead_ids(self.s, frontier, config.LOOKAHEAD)
-                    # 프런티어는 '존재가 확인된 번호'까지만 전진시킨다. lookahead 가 돌려준
-                    # safe_frontier 는 아직 안 생긴/미확정 첫 번호이므로, 이 값을 넘겨 올리면
-                    # 유령(미래) 번호를 지나쳐 나중에 실제 글이 생겨도 못 잡는다.
-                    if safe_frontier > frontier:
-                        frontier = safe_frontier
-                    for pid, precheck in ahead:
+                    # 매 fast tick 은 좁은 창(PROBE_WINDOW, 기본 2 = frontier 와 그 다음
+                    # 번호)만 동시에 찌른다. 실측(고객 5136338 등록 이력)상 실제 글 번호는
+                    # 거의 항상 연속이고 아주 가끔 한 번호를 건너뛰므로, 창 2면 건너뛴 번호도
+                    # 지연 없이 잡힌다. 창 전체(LOOKAHEAD)는 무거운 tick 에서만 훑어(초당 1회)
+                    # 두 개 이상 연속으로 건너뛴 드문 경우까지 커버한다.
+                    width = config.LOOKAHEAD if heavy_due else getattr(config, "PROBE_WINDOW", 2)
+                    live_pids, precheck = self._scan_frontier(frontier, width)
+                    self._last_check = precheck
+                    for pid_i in live_pids:
+                        pid = str(pid_i)
                         if pid in self.seen or pid in self._post_absent_giveup:
                             continue
-                        # register() 가 precheck(rq_addbanner_check 결과)를 재사용하므로 이 글엔
-                        # rq_addbanner 만 한 번 더 쏘면 된다 -> 경쟁사보다 먼저 상단을 잡는다.
-                        registered_ok = self._handle(pid, precheck=precheck)
+                        # 존재가 이미 확인된 글에만 쓰기를 쏜다. frontier 본인이면 같은 tick 에
+                        # 병렬로 받아둔 precheck 를 재사용해 rq_addbanner 1왕복만 더 쏜다.
+                        registered_ok = self._handle(
+                            pid, precheck=(precheck if pid_i == frontier else None))
                         # 실존이 확정된(등록 성공/이미등록/거부-실재) 글이면 프런티어를 그 너머로
-                        # 전진시킨다. post_absent(유령/미래 번호)면 전진하지 않아 폭주를 막는다.
+                        # 전진시킨다. 아직 안 뜬 번호는 애초에 live_pids 에 없으므로 프런티어가
+                        # 유령 번호를 지나칠 일이 없다(폭주 방지가 구조적으로 보장된다).
                         if registered_ok and pid.isdigit() and int(pid) >= frontier:
                             frontier = int(pid) + 1
                         if self.should_stop():
@@ -786,12 +920,30 @@ class Registrar:
                 # 작업이라 LIST_POLL_SECONDS(기본 1.0s) 마다만 얹혀서 돈다. 위 1)번 fast tick
                 # 은 이 조건과 무관하게 항상 돈다(그게 이번 튜닝의 핵심). 무거운 tick 이 아닌
                 # 사이클은 여기서 그냥 짧게 쉬고 다음 fast tick 으로 넘어간다.
-                now_ts = time.time()
-                if (now_ts - self._last_heavy_tick) < config.LIST_POLL_SECONDS:
-                    self._wait(config.FRONTIER_POLL_SECONDS)
+                if not heavy_due:
+                    self._wait(self._fast_sleep(tick_started))
                     continue
                 self._last_heavy_tick = now_ts
                 self._cycle += 1
+                # v2.6.0: 예전에는 프런티어에 매 tick rq_addbanner 를 쏘고 있었기 때문에
+                # 세션 사망 신호(session_lost)와 배너잔여(amount)가 register() 결과로 늘
+                # 갱신됐다. 이제는 글이 실제로 뜰 때만 쓰기를 쏘므로, 그 두 신호를 매 tick
+                # 병렬로 받아둔 rq_addbanner_check(_last_check)에서 무거운 tick 당 1회 반영한다
+                # (예전과 정확히 같은 빈도 = 사이클당 1회. 자가치유/재로그인 임계값 의미 불변).
+                lc = self._last_check
+                if lc is not None:
+                    _lc_data = lc[1] or {}
+                    if _lc_data.get("result") is True:
+                        self._session_lost_streak = 0
+                        try:
+                            _av = _lc_data.get("amount")
+                            if _av is not None:
+                                self._last_amount = (int(_av) if str(_av).strip().lstrip("-").isdigit()
+                                                     else _av)
+                        except Exception:
+                            pass
+                    elif _is_session_lost_msg(_lc_data.get("msg") or ""):
+                        self._session_lost_streak += 1
 
                 # 0) 프런티어 자가 보정(runaway 회복): 프런티어는 '실제 최신 글 + 1'을 기준으로
                 # look-ahead 창(LOOKAHEAD)만큼만 앞서야 한다. 계정이 잠시 no_permission 상태에
@@ -910,9 +1062,10 @@ class Registrar:
                     self.log("로그인이 만료되었습니다. 다시 로그인해 주세요.")
                     self.remote("session_expired", "loop 예외 후 세션 무효 확인", force=True)
                     return
-            # v2.5.5: 매 tick(=새 글 감지 지연 상한)은 이제 FRONTIER_POLL_SECONDS(0.2s) 기준.
+            # v2.5.5: 매 tick(=새 글 감지 지연 상한)은 이제 FRONTIER_POLL_SECONDS 기준.
             # 무거운 목록 fetch(LIST_POLL_SECONDS)는 위 루프 안에서 별도 타이머로 게이팅된다.
-            self._wait(config.FRONTIER_POLL_SECONDS)
+            # v2.6.0: 그 간격을 '작업 후 고정 sleep'이 아니라 tick 시작 시각 기준으로 잡는다.
+            self._wait(self._fast_sleep(tick_started))
         self.remote("run_stopped", "폴링 루프 중지", force=True)
 
     def _handle(self, pid, precheck=None):
