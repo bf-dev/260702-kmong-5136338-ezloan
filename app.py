@@ -250,6 +250,7 @@ class App:
         """쿠키로 등록 루프를 돈다(로그인 경로/세션 복구 경로 공용)."""
         import os
         from ezloan_bot import Registrar
+        registrar = None
         try:
             self.set_status("로그인 완료! 배너 자동등록을 시작합니다.")
             seen_path = os.path.join(config.APP_DIR, "seen-posts.json")
@@ -262,6 +263,12 @@ class App:
             self.set_status(f"오류: {e}")
             remote_log("run_error", traceback.format_exc()[:3000], force=True)
         finally:
+            # v2.6.0: 존재-확인용 스레드풀/세션 정리(시작/정지 반복 시 스레드 누수 방지).
+            if registrar is not None:
+                try:
+                    registrar.close()
+                except Exception:
+                    pass
             self.root.after(0, self._finish)
             self.set_status("정지됨")
 

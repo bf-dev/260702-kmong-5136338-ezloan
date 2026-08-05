@@ -725,6 +725,21 @@ class Registrar:
         except Exception:
             return False
 
+    def close(self):
+        """등록 루프가 끝난 뒤 프로브 스레드풀/세션을 정리한다.
+
+        고객이 [시작]/[정지] 를 반복하면 Registrar 가 매번 새로 만들어지므로, 정리하지
+        않으면 존재-확인용 워커 스레드와 keep-alive 소켓이 실행 내내 쌓인다.
+        """
+        try:
+            self._probe_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self.probe.close()
+        except Exception:
+            pass
+
     def _fast_sleep(self, tick_started):
         """이 tick 이 '시작된 시각' 기준으로 다음 tick 까지 남은 시간만 돌려준다.
 

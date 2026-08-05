@@ -63,6 +63,14 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_frontier_fast_tick.py
 
+      # 2026-08-05 (v2.6.0): 실제 운영 상태(새 글이 7~80분 간격으로 뜨는 대기 구간)에서
+      # 새 글 등장 -> rq_addbanner 발사까지의 지연을 잰다. v2.5.5 는 감지기로 '쓰기'를 쓰다
+      # 백오프에 묶여 1.4~5.7초씩 늦었다(이 스크립트는 v2.5.5 코드에서 실제로 실패한다).
+      - name: Verify steady-state detection lag is tick-bounded (2026-08-05, v2.6.0)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_steady_state_detect_lag.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8
