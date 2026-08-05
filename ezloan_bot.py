@@ -15,6 +15,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from http.cookiejar import DefaultCookiePolicy
 from pathlib import Path
 
 import requests
@@ -240,8 +241,18 @@ def new_probe_session():
     없이도 완전히 동일하게 판별된다(2026-08-05 실측, KR egress 로 확인).
 
     keep-alive 를 유지하는 게 핵심이다(실측: 웜 커넥션 p50 46.8ms vs 콜드 ~98ms).
+
+    쿠키는 정책으로 아예 차단한다. 단순한 위생 문제가 아니라 '속도' 문제다(2026-08-05 실측,
+    KR egress): 쿠키를 받아두면 창(PROBE_WINDOW) 안의 두 요청이 같은 ezloan_sess 를 달고
+    나가고, 이지론(PHP)의 세션 파일 잠금 때문에 두 요청이 서버에서 직렬화된다 - 병렬로
+    쏴도 왕복이 50ms -> 150ms 로 3배가 됐다. 쿠키를 막으면 요청마다 서버가 별도 세션을
+    잡아 잠금 경합이 없어져 창 2개든 3개든 병렬 왕복이 50~53ms 로 유지된다.
+      창2 쿠키ON  : scan p50 148.6ms
+      창2 쿠키차단: scan p50  50.4ms
+      창3 쿠키차단: scan p50  53.0ms
     """
     s = requests.Session()
+    s.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
