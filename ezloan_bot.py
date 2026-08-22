@@ -176,15 +176,87 @@ def session_from_cookies(cookies):
     return s
 
 
-def logged_in(s):
+# 로그인 판정 결과. 반드시 3값이다(2026-08-22 사고 재발 방지, 아래 login_state 주석 참고).
+LOGIN_IN = "LOGGED_IN"        # 200 응답이 '로그인 상태'를 실제로 보여줌
+LOGIN_OUT = "LOGGED_OUT"      # 200 응답이 '로그아웃 상태'를 실제로 보여줌
+LOGIN_UNKNOWN = "UNKNOWN"     # 판정 불가(타임아웃/연결오류/5xx/521/차단/알 수 없는 본문)
+
+# 실측(2026-08-23, KR egress, 비로그인으로 /rq 조회): 로그아웃 상태의 목록 페이지는
+# HTTP 200 + 331KB 이고 '로그아웃'/'광고 관리' 가 하나도 없으며, 대신 아래 마커가 있다.
+#   <a href="https://ezloan.io/m/login" class="log in flex" title="로그인">   (x2)
+#   <!-- // 비로그인 { -->                                                   (주석 블록)
+# 즉 '로그아웃 상태'에는 고유한 양성 마커가 존재하므로, 로그인 마커가 없다는 것만으로
+# 로그아웃이라고 단정할 필요가 전혀 없다(그 단정이 2026-08-22 사고의 뿌리였다).
+_LOGGED_IN_MARKERS = ("로그아웃", "광고 관리")
+_LOGGED_OUT_MARKERS = ("로그인 해주세요", 'class="log in flex"', "비로그인 {", "비로그인시 {")
+
+
+def login_state(s, max_known_id=0):
+    """세션의 로그인 상태를 LOGIN_IN / LOGIN_OUT / LOGIN_UNKNOWN 으로 판정한다.
+
+    2026-08-22 사고(고객 5136338, 17시간 57분 무동작)의 직접 원인이 여기 있었다.
+    예전 logged_in() 은 True/False 두 값뿐이라 '사이트가 죽어서 대답을 못 함' 과
+    '세션이 실제로 만료됨' 을 구분할 수 없었다. 04:55~04:56 UTC 에 ezloan.io 가 42초간
+    죽어(HTTP 521 x5 = Cloudflare 원본 다운, 이어서 read timeout=12) 이 함수가 False 를
+    돌려주자, run() 이 '세션 사망' 으로 오판하고 워커 스레드를 통째로 종료했다.
+    사이트는 1분 만에 살아났지만 앱은 17시간 57분 동안 '정지됨' 으로 서 있었다.
+
+    그래서 이제 판정은 3값이다. **핵심 규칙: 실패한 응답(=200이 아닌 응답)이나 아예 없는
+    응답으로는 절대 '세션 사망' 을 결론내지 않는다.** 오직 '정상적으로 도착한 200 응답이
+    로그아웃 상태를 실제로 보여줄 때' 만 LOGIN_OUT 이다.
+      - 예외(타임아웃/연결 끊김/DNS) -> UNKNOWN
+      - 5xx, 502/503/521/522/524(Cloudflare 원본 장애), 403(WAF/차단), 429 -> UNKNOWN
+      - 200 인데 로그인/로그아웃 마커가 전혀 없음(점검 페이지, CF 인터스티셜) -> UNKNOWN
+    UNKNOWN 은 '기다렸다 다시 물어봐라' 라는 뜻이고, 호출자는 절대 이걸로 스레드를 죽이거나
+    재로그인을 요구하면 안 된다.
+    """
     try:
         r = s.get(config.RQ_URL, timeout=10, allow_redirects=True)
     except Exception:
-        return False
-    if r.status_code != 200 or "login" in r.url.lower():
-        return False
-    t = r.text
-    return ("로그아웃" in t or "광고 관리" in t) and "로그인 해주세요" not in t
+        # 타임아웃/연결 오류. 사이트가 대답을 못 한 것이지 세션이 죽은 게 아니다.
+        return LOGIN_UNKNOWN
+    if r.status_code != 200:
+        # 521/522/524(원본 다운), 502/503, 403(차단), 429 등 전부 여기로 온다.
+        # 로그인 상태에 대해 아무 정보도 없는 응답이므로 판정 불가.
+        return LOGIN_UNKNOWN
+    try:
+        url = (r.url or "").lower()
+    except Exception:
+        url = ""
+    t = r.text or ""
+    if any(m in t for m in _LOGGED_IN_MARKERS) and "로그인 해주세요" not in t:
+        return LOGIN_IN
+    # 여기부터는 '로그아웃처럼 보이는' 200 응답이다. 그런데 사이트 장애 중에는
+    # Cloudflare 가 원본(521) 대신 '오래전에 캐시해 둔 비로그인 페이지' 를 200 으로
+    # 내려준다(2026-08-22 실측: 그 페이지의 최신 글번호는 30104, 그때 실제 프런티어는
+    # 31985). 캐시된 페이지를 로그아웃으로 읽으면 멀쩡한 세션인데 크롬을 띄워 재로그인을
+    # 시키게 된다. 목록의 최신 글번호가 우리가 이미 확인한 번호보다 크게 뒤처져 있으면
+    # 그건 지금의 페이지가 아니므로 판정 불가로 돌린다.
+    if max_known_id:
+        try:
+            page_max = max((int(x) for x in _RQ_LINK_RE.findall(t)), default=0)
+        except Exception:
+            page_max = 0
+        lag_limit = int(getattr(config, "STALE_LIST_MAX_LAG", 50))
+        if page_max and page_max < int(max_known_id) - lag_limit:
+            return LOGIN_UNKNOWN
+    # 로그인 폼으로 리다이렉트됐거나(=서버가 명시적으로 로그아웃 처리), 로그아웃 전용
+    # 마커가 본문에 있으면 그때만 '진짜 로그아웃' 이다.
+    if "/login" in url:
+        return LOGIN_OUT
+    if any(m in t for m in _LOGGED_OUT_MARKERS):
+        return LOGIN_OUT
+    # 200 이지만 목록 페이지가 아니다(점검 안내, Cloudflare 인터스티셜, 잘린 본문 등).
+    return LOGIN_UNKNOWN
+
+
+def logged_in(s):
+    """하위 호환 래퍼. '확실히 로그인 상태' 일 때만 True.
+
+    주의: False 는 '로그아웃' 이 아니라 '로그인이 확인되지 않음'(로그아웃 또는 판정 불가)
+    이다. 세션 사망 여부를 판정하는 데 이 함수를 쓰면 안 된다. login_state() 를 써라.
+    """
+    return login_state(s) == LOGIN_IN
 
 
 def list_post_ids(s, max_posts=config.MAX_POSTS):
@@ -486,7 +558,7 @@ class Registrar:
     """로그인 후 requests 세션으로 등록 루프를 돈다."""
 
     def __init__(self, cookies, log=print, remote=None, should_stop=None,
-                 seen_path=None, relogin=None):
+                 seen_path=None, relogin=None, status=None):
         self.s = session_from_cookies(cookies)
         # v2.6.0: 글 존재 확인 전용(비로그인) 세션 + 그 확인들을 '동시에' 쏘는 작은 풀.
         # 로그인 세션과 분리하는 이유는 new_probe_session() 주석 참고.
@@ -497,6 +569,9 @@ class Registrar:
         self._cookies_raw = cookies or []
         self._diag_sent = False   # auth_diag_dump 는 실행당 1회만
         self.log = log
+        # GUI 상단 상태줄 갱신 콜백(선택). 사이트 장애로 대기 중일 때 '정지됨' 처럼
+        # 보이지 않도록 '사이트 응답 없음, 재시도 중' 을 여기로 올린다.
+        self.status = status or (lambda *a, **k: None)
         self.remote = remote or (lambda *a, **k: None)
         self.should_stop = should_stop or (lambda: False)
         # 강제 재로그인 콜백(선택). 등록이 '새 글'에서까지 지속적으로 거부되는데 세션은
@@ -553,6 +628,17 @@ class Registrar:
         # 아니라 계정/게시글 측 등록 불가 상태다. 조용히 초당 수십 회 재시도하며 사이트를
         # 두드리는 대신, 폴링 간격을 늘려(backoff) 부담을 줄이고 원인을 명확히 알린다.
         self._auth_mismatch_streak = 0
+        # 사이트 장애(응답 없음)로 대기에 들어간 시각과, 마지막으로 원격 보고한 시각.
+        # 2026-08-22 사고 이후 추가: 이 상태는 '정지' 가 아니라 '대기' 이며, 루프는 계속 산다.
+        self._site_down_since = None
+        self._site_down_reported = 0.0
+        self._site_down_polls = 0
+        # 진짜 로그아웃이 확인돼 강제 재로그인을 시도한 횟수(실행당).
+        self._relogin_attempts = 0
+        # 지금까지 목록에서 실제로 확인한 가장 큰 글번호. 사이트 장애 중 Cloudflare 가
+        # 내려주는 '캐시된 옛 목록'을 걸러내는 기준이다(run() 의 stale_list 주석 참고).
+        self._max_live_id = 0
+        self._stale_list_streak = 0
         # 세션 쿠키 진단(ezloan_sess 유무). 값은 절대 로그로 보내지 않는다.
         try:
             names = sorted({c.get("name", "") for c in cookies if c.get("name")})
@@ -665,7 +751,7 @@ class Registrar:
         except Exception:
             pass
 
-    def _force_relogin(self):
+    def _force_relogin(self, reason="등록이 계속 거부되어"):
         """새 글에서까지 등록이 지속 거부될 때, 새 이지론 세션을 다시 받아 온다(실행당 1회).
 
         가설(고객 문의): 광고 상품을 연장했는데도 앱이 '연장 전' 세션 쿠키를 그대로 물고
@@ -676,9 +762,10 @@ class Registrar:
         원인이 서버측 계정 할당일 가능성이 크지만, 낡은-세션 케이스까지 커버하는 안전장치다.
         """
         self._relogin_done = True
-        self.log("등록이 계속 거부되어 로그인 세션을 새로 받아옵니다(재로그인)...")
+        self.log(f"{reason} 로그인 세션을 새로 받아옵니다(재로그인)...")
+        self.status("로그인 세션을 새로 받는 중...")
         self.remote("force_relogin_start",
-                    "새 글에서도 등록 지속 거부(logged_in=True) -> 강제 재로그인으로 새 세션 확보 시도",
+                    f"강제 재로그인으로 새 세션 확보 시도(사유: {reason})",
                     force=True)
         try:
             new_cookies = self.relogin()
@@ -693,11 +780,14 @@ class Registrar:
         self._cookies_raw = new_cookies
         self._fresh_refuse_streak = 0
         self._persist_session(force=True)
-        ok = logged_in(self.s)
+        st = login_state(self.s, self._max_live_id)
+        ok = st == LOGIN_IN
         self.remote("force_relogin_done",
-                    f"새 세션 확보(logged_in={ok}, 쿠키 {len(new_cookies)}개). 등록 재개.",
+                    f"새 세션 확보(login_state={st}, 쿠키 {len(new_cookies)}개). 등록 재개.",
                     force=True)
-        return ok
+        # 판정 불가(사이트가 아직 안 돌아옴)는 실패로 치지 않는다 - 쿠키는 새로 받았으므로
+        # 그대로 진행하고, 사이트가 살아나면 다음 점검에서 LOGIN_IN 이 확인된다.
+        return ok or st == LOGIN_UNKNOWN
 
     def _heal_session(self):
         """중복 세션 쿠키를 정리하고 /rq 재조회로 슬라이딩 세션을 갱신한다.
@@ -735,6 +825,110 @@ class Registrar:
             return ok
         except Exception:
             return False
+
+    def _ensure_session(self, reason):
+        """등록을 계속해도 되는 상태인지 확인한다. True=계속, False=워커 종료.
+
+        2026-08-22 사고(고객 5136338, 17시간 57분 무동작)의 수정 지점이다.
+        예전 코드는 아래 두 자리에서 `if not logged_in(self.s): ... return` 을 했다.
+        그 `return` 은 run() 을 통째로 빠져나가 app.py 의 finally 가 상태를 '정지됨' 으로
+        바꾸고 [시작] 버튼을 되살린다. 즉 42초짜리 사이트 장애 하나가 프로그램을 영구히
+        멈춰 세웠다(사이트는 1분 만에 회복했지만 앱은 17시간 57분 동안 멈춰 있었다).
+        run_stopped 로그가 한 줄도 남지 않은 것이 그 경로로 빠져나갔다는 증거였다.
+
+        이제 판정은 3값이다(login_state 참고).
+          LOGIN_IN      -> 즉시 True. 아무 일도 없었던 것처럼 등록을 계속한다.
+          LOGIN_UNKNOWN -> 사이트가 대답을 못 하는 것뿐이다. 5초 -> 60초로 늘어나는 간격으로
+                           '무한정' 다시 물어본다. 절대 스레드를 죽이지 않는다.
+                           사이트가 대답하는 순간 그대로 등록을 재개한다.
+          LOGIN_OUT     -> 이때만 진짜 세션 사망이다. 스레드를 죽이는 대신 기존
+                           _forced_relogin 콜백으로 새 세션을 받아 계속한다. 재로그인
+                           자체가 (자격증명 없음/취소/실패로) 안 될 때만 False 를 돌려준다.
+        """
+        delay = float(getattr(config, "SITE_RETRY_MIN_SECONDS", 5.0))
+        delay_max = float(getattr(config, "SITE_RETRY_MAX_SECONDS", 60.0))
+        report_every = float(getattr(config, "SITE_RETRY_REPORT_SECONDS", 300.0))
+        max_relogin = int(getattr(config, "SESSION_RELOGIN_MAX_ATTEMPTS", 3))
+
+        while not self.should_stop():
+            st = login_state(self.s, self._max_live_id)
+
+            if st == LOGIN_IN:
+                if self._site_down_since is not None:
+                    down_for = time.time() - self._site_down_since
+                    self.log(f"사이트가 다시 응답합니다. 자동등록을 계속합니다. "
+                             f"(대기 {down_for:.0f}초)")
+                    self.status("자동등록 진행 중")
+                    self.remote(
+                        "site_recovered",
+                        f"사이트 응답 복구({down_for:.0f}초 만에, 재시도 {self._site_down_polls}회). "
+                        f"등록 루프는 종료되지 않고 그대로 재개. 최초 사유: {reason}",
+                        force=True,
+                    )
+                    self._site_down_since = None
+                    self._site_down_polls = 0
+                return True
+
+            if st == LOGIN_OUT:
+                # 200 응답이 '로그아웃 상태' 를 실제로 보여준 경우에만 여기 온다.
+                self._site_down_since = None
+                if not self.relogin:
+                    self.log("로그인 세션이 만료되었습니다. 프로그램을 다시 시작해 로그인해 주세요.")
+                    self.remote("session_expired",
+                                f"로그아웃 확인(login_state=LOGGED_OUT, 사유: {reason}). "
+                                "재로그인 콜백이 없어 등록 루프 종료.", force=True)
+                    return False
+                if self._relogin_attempts >= max_relogin:
+                    self.log("로그인 세션을 새로 받는 데 계속 실패했습니다. "
+                             "[정지] 후 아이디/비밀번호로 다시 [시작]해 주세요.")
+                    self.remote("relogin_exhausted",
+                                f"로그아웃 확인 후 강제 재로그인 {self._relogin_attempts}회 모두 실패. "
+                                f"등록 루프 종료(사유: {reason}).", force=True)
+                    return False
+                self._relogin_attempts += 1
+                self.remote(
+                    "session_logged_out",
+                    f"로그아웃 확인(login_state=LOGGED_OUT, 사유: {reason}). "
+                    f"스레드 종료 대신 강제 재로그인 시도 {self._relogin_attempts}/{max_relogin}.",
+                    force=True,
+                )
+                if self._force_relogin(reason="로그인 세션이 만료되어"):
+                    self._session_lost_streak = 0
+                    self.status("자동등록 진행 중")
+                    return True
+                # 재로그인이 실패했다. 자격증명이 없으면(세션 복구로만 시작) 더 시도해도
+                # 소용없으므로 즉시 멈춘다. 그 외에는 잠시 뒤 다시 시도한다.
+                if self._relogin_attempts >= max_relogin:
+                    continue
+                self.status("로그인 세션 재발급 실패, 잠시 뒤 다시 시도합니다")
+                self._wait(float(getattr(config, "SESSION_RELOGIN_RETRY_SECONDS", 60.0)))
+                continue
+
+            # --- LOGIN_UNKNOWN: 사이트가 대답을 못 하는 상태. 기다린다. -------------
+            now_ts = time.time()
+            if self._site_down_since is None:
+                self._site_down_since = now_ts
+                self._site_down_reported = 0.0
+                self._site_down_polls = 0
+                self.log("이지론 사이트가 응답하지 않습니다. 자동으로 계속 재시도합니다. "
+                         "(프로그램은 멈추지 않습니다)")
+                self.status("사이트 응답 없음, 재시도 중...")
+            self._site_down_polls += 1
+            if now_ts - self._site_down_reported >= report_every or self._site_down_polls == 1:
+                self._site_down_reported = now_ts
+                down_for = now_ts - self._site_down_since
+                self.remote(
+                    "site_unreachable",
+                    f"사이트 응답 없음(login_state=UNKNOWN, 사유: {reason}) - "
+                    f"{down_for:.0f}초째 대기, 재시도 {self._site_down_polls}회, "
+                    f"다음 재시도 {delay:.0f}초 뒤. 등록 루프는 살아 있음(스레드 종료 안 함).",
+                    force=True,
+                )
+            self._wait(delay)
+            delay = min(delay * 2, delay_max)
+
+        # should_stop: 고객이 [정지] 를 눌렀다. 이건 정상 종료다.
+        return False
 
     def close(self):
         """등록 루프가 끝난 뒤 프로브 스레드풀/세션을 정리한다.
@@ -850,9 +1044,14 @@ class Registrar:
         return False
 
     def run(self):
-        if not logged_in(self.s):
-            self.log("세션이 유효하지 않습니다. 다시 로그인해 주세요.")
-            self.remote("session_invalid", "requests 세션이 이지론 로그인 상태가 아님(등록 API 인증 실패 예상)", force=True)
+        # 시작 시점 세션 점검. 사이트가 마침 죽어 있으면(521/타임아웃) 예전엔 여기서 곧바로
+        # '세션 무효' 로 종료했는데, 그건 판정 불가를 세션 사망으로 오독한 것이다.
+        # 이제는 사이트가 대답할 때까지 기다렸다가 시작한다(_ensure_session 주석 참고).
+        if not self._ensure_session("시작 시 세션 점검"):
+            if not self.should_stop():
+                self.log("세션이 유효하지 않습니다. 다시 로그인해 주세요.")
+                self.remote("session_invalid",
+                            "시작 시 로그아웃 확인(login_state=LOGGED_OUT) + 재로그인 실패", force=True)
             return
         # 시작 시점이 운영 시간대 밖이면(기본 23:00~08:00 KST) 로그인 상태만 확인해 두고,
         # API 를 두드리지 않고 시간대 진입까지 대기한다(창은 유지).
@@ -863,24 +1062,53 @@ class Registrar:
         self.remote("run_started", f"폴링 루프 시작(운영시간대 {self._window_label()})", force=True)
 
         # 시작/재시작 재기준화: 지금 목록의 '실제 최신 글'을 기준으로 프런티어를 잡고,
-        # 현재 목록 전체를 seen 으로 흡수한다. 이렇게 하면 이후엔 '진짜 새로 생기는 글'만
+        # 이미 처리한 옛 글들을 seen 으로 흡수한다. 이렇게 하면 이후엔 '진짜 새로 생기는 글'만
         # 등록하고, 재시작 전에 이미 처리한(등록한) 옛 글들을 다시 add 로 두드리지 않는다.
         # (핵심 재현: 예전엔 look-ahead 로 프런티어가 유령 번호까지 폭주한 값이었다가, 재시작
         #  때 실제 최신글 기준으로 되감겨 '이미 등록한 실재 글'을 재-add -> 전부 '404 error'
-        #  -> 등록 0 + 거짓 auth_mismatch 였다. 이제 목록을 seen 에 흡수해 재-add 를 막는다.
+        #  -> 등록 0 + 거짓 auth_mismatch 였다. 그래서 목록을 seen 에 흡수해 재-add 를 막는다.
         #  혹시 look-ahead 가 그런 옛 글을 집더라도 register() 가 add_refused 로 조용히 건너뛴다.)
+        #
+        # v2.6.1 수정(2026-08-05 발견, 2026-08-23 수정): 예전에는 '현재 목록 전체' 를 통째로
+        # seen 에 흡수했다. 그 부작용으로, 프로그램이 꺼져 있던(또는 재시작 중이던) 사이에
+        # 올라온 글까지 '이미 본 글' 로 도장이 찍혀 영원히 등록되지 않았다.
+        # 실측: 글 31150~31244 중 10건(31165~31174 아홉 연속 + 31203)에 이 고객 배너가 아예
+        # 없었고, 그 번호대는 로그상 재시작 구간과 정확히 일치한다.
+        # 이제는 '디스크에 남아 있는 seen 의 최대 글번호(prev_max)' 를 기준으로 삼는다.
+        #   - prev_max 이하의 글  -> 재시작 전에 이미 처리한 글. 그대로 흡수(재-add 방지).
+        #   - prev_max 초과의 글  -> 꺼져 있는 동안 새로 올라온 글. 흡수하지 않고 남겨서
+        #                            아래 목록 안전망이 등록을 시도하게 한다.
+        # 며칠 꺼져 있었던 경우까지 전부 따라잡으면 오래된 글에 배너 잔여를 낭비하므로,
+        # 따라잡는 개수는 최신 RESTART_CATCHUP_MAX 개로 제한하고 나머지는 흡수한다.
+        # seen 이 아예 비어 있으면(최초 실행/설정 초기화) 기준이 없으므로 예전처럼 전체를
+        # 흡수한다 - 이때 흡수하지 않으면 목록 20개 전부를 새 글로 오인해 등록을 시도한다.
         baseline = list_post_ids(self.s)
+        prev_max = max((int(x) for x in self.seen if str(x).isdigit()), default=0)
+        catchup_max = int(getattr(config, "RESTART_CATCHUP_MAX", 10))
+        newer = sorted((x for x in baseline if str(x).isdigit() and int(x) > prev_max),
+                       key=int, reverse=True)
+        if prev_max <= 0:
+            catchup, absorb = [], list(baseline)
+        else:
+            catchup = newer[:catchup_max]
+            absorb = [x for x in baseline if x not in set(catchup)]
         before = len(self.seen)
-        self.seen.update(baseline)
+        self.seen.update(absorb)
         self._write_seen()
         known_max = max((int(x) for x in list(self.seen) + baseline if str(x).isdigit()), default=0)
         frontier = known_max + 1
+        self._max_live_id = max(self._max_live_id, known_max)
         self.remote(
             "baseline",
             f"초기 목록 {len(baseline)}개(seen 흡수 {len(self.seen) - before}건 추가), "
-            f"최대번호={known_max}, frontier={frontier}(재시작 시 옛 글 재등록 방지)",
+            f"직전 seen 최대={prev_max}, 최대번호={known_max}, frontier={frontier}. "
+            f"재시작 중 놓친 글 따라잡기 대상 {len(catchup)}건"
+            + (f"({','.join(catchup)})" if catchup else "(없음)")
+            + f", 흡수 제외 상한 {catchup_max}건.",
             force=True,
         )
+        if catchup:
+            self.log(f"프로그램이 꺼져 있는 동안 올라온 글 {len(catchup)}건을 확인해 등록을 시도합니다.")
 
         while not self.should_stop():
             # v2.6.0: tick 간격을 '작업 후 고정 sleep'이 아니라 '이 tick 시작 시각 기준
@@ -980,6 +1208,41 @@ class Registrar:
                 # 목록은 무거운 tick당 '한 번만' 가져온다(각 ~309KB, 재동기화·안전망 공용).
                 ids = list_post_ids(self.s)
                 real_max = max((int(x) for x in ids if str(x).isdigit()), default=0)
+                # v2.6.1: 낡은(캐시된) 목록 방어. 2026-08-22 장애 로그 실측:
+                # ezloan.io 원본이 죽자(521) Cloudflare 가 '한참 전에 캐시된 목록 페이지'를
+                # HTTP 200 으로 대신 내려줬다. 그 페이지의 최신 글은 30104 였는데 그 시점의
+                # 실제 프런티어는 31985 였다. 앱은 이걸 '프런티어 폭주'로 오인해
+                #   [frontier_resync] frontier=31985 -> 30105
+                # 로 1,880개나 되감았고, 이어서 2주 전 옛 글 9개를 '새 글'로 보고 등록을
+                # 시도했다(로그의 목록=20 새글=9 + register_skip 30088/30103). 배너 잔여를
+                # 옛 글에 낭비할 수 있는 경로다.
+                # 글번호는 단조증가하므로, 이미 확인한 최신 번호보다 목록의 최신이 크게
+                # 뒤처져 있으면 그 목록은 '지금의 목록'이 아니다. 되감기도, 안전망도 건너뛴다.
+                # (프런티어 선행 탐지는 그대로 도므로 진짜 새 글은 계속 잡는다.)
+                lag_limit = int(getattr(config, "STALE_LIST_MAX_LAG", 50))
+                if real_max and self._max_live_id and real_max < self._max_live_id - lag_limit:
+                    self._stale_list_streak += 1
+                    if self._stale_list_streak <= 3 or self._stale_list_streak % 60 == 0:
+                        self.remote(
+                            "stale_list",
+                            f"목록이 낡았다고 판단: 목록최신={real_max} < 지금까지 확인한 최신"
+                            f"({self._max_live_id})-{lag_limit}. 사이트 장애 중 캐시된 옛 페이지로 보임"
+                            f"(연속 {self._stale_list_streak}회). 프런티어 되감기/목록 안전망을 건너뛴다.",
+                            force=True,
+                        )
+                    # 목록이 오래도록 계속 이 상태면(글이 실제로 대량 삭제된 경우) 새 현실을
+                    # 받아들여 다음 사이클부터 정상 처리한다(영구 정체 방지).
+                    if self._stale_list_streak >= int(getattr(config, "STALE_LIST_ACCEPT_AFTER", 600)):
+                        self.remote("stale_list_accepted",
+                                    f"목록최신={real_max} 상태가 {self._stale_list_streak}회 지속 - "
+                                    "실제 목록 축소로 보고 기준을 재설정한다.", force=True)
+                        self._max_live_id = real_max
+                        self._stale_list_streak = 0
+                    ids, real_max = [], 0
+                elif real_max:
+                    self._stale_list_streak = 0
+                    if real_max > self._max_live_id:
+                        self._max_live_id = real_max
                 if real_max:
                     sane_frontier = real_max + 1
                     # 정상 앞섬(창 크기)보다 크게 벗어났을 때만 되돌린다(정상 미세 앞섬은 유지).
@@ -1032,16 +1295,22 @@ class Registrar:
 
                 # 2) 자가 치유로도 계속 거부되면(연속 4회) 조용히 도는 대신 크게 알린다.
                 if self._session_lost_streak >= 4:
-                    if not logged_in(self.s):
-                        # logged_in() 이 유일한 세션 사망 판정 권한이다. 여기서만 재로그인을 요구한다.
-                        self.log("로그인 세션이 만료되었습니다. 프로그램을 다시 시작해 로그인해 주세요. (재로그인이 필요합니다)")
-                        self.remote(
-                            "session_expired",
-                            f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error'), "
-                            "중복 쿠키 정리+세션 갱신 후에도 회복 실패. 재로그인 필요.",
-                            force=True,
-                        )
-                        return
+                    st = login_state(self.s, self._max_live_id)
+                    if st != LOGIN_IN:
+                        # login_state() 가 유일한 세션 사망 판정 권한이다. 여기서만 재로그인을
+                        # 요구한다. LOGGED_OUT 이면 _ensure_session 이 재로그인으로 복구하고,
+                        # UNKNOWN(사이트 장애)이면 사이트가 살아날 때까지 기다렸다 계속한다.
+                        # 어느 쪽이든 예전처럼 `return` 으로 스레드를 죽이지 않는다.
+                        if not self._ensure_session(
+                                f"연속 {self._session_lost_streak}회 인증 실패(msg='404 error') 후 점검"):
+                            self.remote("run_stopped",
+                                        f"연속 인증 실패 후 세션 확보 실패로 종료"
+                                        f"(session_lost_streak={self._session_lost_streak})",
+                                        force=True)
+                            return
+                        self._session_lost_streak = 0
+                        self._wait(self._fast_sleep(tick_started))
+                        continue
                     # 목록 페이지는 로그인으로 보이는데 등록 API 만 계속 404 error 로 거부되는 상황.
                     # 세션은 살아있으므로(logged_in=True) 이건 세션 사망이 아니라 계정/게시글 측
                     # 등록 불가 상태다(예: 유료 배너 소진, 계정 권한/정지, 이지론 서버 일시 이상).
@@ -1081,12 +1350,25 @@ class Registrar:
                 if self._registered_total and self._auth_mismatch_streak:
                     self._auth_mismatch_streak = 0
             except Exception as e:
+                # ★ 2026-08-22 사고가 시작된 바로 그 자리다. ★
+                # 04:55 UTC 에 ezloan.io 가 42초 죽으면서(521 x5 -> ReadTimeout(read=12))
+                # 목록 fetch 가 여기로 떨어졌고, 예전 코드는 곧바로 logged_in() 을 물었다.
+                # 사이트가 죽어 있으니 당연히 False -> '세션 무효' 로 오판 -> `return` ->
+                # app.py 의 finally 가 '정지됨' 을 찍고 끝. 사이트는 1분 만에 살아났지만
+                # 앱은 17시간 57분을 그대로 서 있었고 그 사이 모든 글을 놓쳤다.
+                # (run_stopped 로그가 한 줄도 없던 것이 이 경로로 빠져나간 증거였다.)
+                # 이제는 예외 자체가 세션에 대해 아무것도 증명하지 않는다고 보고,
+                # _ensure_session() 으로 '정말 로그아웃인지' 를 확인한다.
                 import traceback
                 self.log(f"오류(계속 시도 중): {e}")
                 self.remote("run_error", traceback.format_exc()[:1500], force=True)
-                if not logged_in(self.s):
-                    self.log("로그인이 만료되었습니다. 다시 로그인해 주세요.")
-                    self.remote("session_expired", "loop 예외 후 세션 무효 확인", force=True)
+                if not self._ensure_session(f"루프 예외 후 점검({type(e).__name__})"):
+                    # 여기까지 왔으면 '진짜 로그아웃 + 재로그인 실패' 이거나 고객이 [정지] 를
+                    # 누른 것이다. 어느 쪽이든 종료 사유를 반드시 한 줄 남긴다(예전 사고 때
+                    # run_stopped 가 한 줄도 없어 원인 추적이 늦어졌다).
+                    self.remote("run_stopped",
+                                f"루프 예외 후 세션 확보 실패로 종료(예외 {type(e).__name__})",
+                                force=True)
                     return
             # v2.5.5: 매 tick(=새 글 감지 지연 상한)은 이제 FRONTIER_POLL_SECONDS 기준.
             # 무거운 목록 fetch(LIST_POLL_SECONDS)는 위 루프 안에서 별도 타이머로 게이팅된다.

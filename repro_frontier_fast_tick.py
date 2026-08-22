@@ -128,6 +128,14 @@ def build_registrar():
     r._no_perm_warned = False
     r._relogin_done = False
     r._auth_mismatch_streak = 0
+    # v2.6.1: 사이트 장애 대기/재로그인 상태(_ensure_session).
+    r.status = lambda *a, **k: None
+    r._site_down_since = None
+    r._site_down_reported = 0.0
+    r._site_down_polls = 0
+    r._relogin_attempts = 0
+    r._max_live_id = 0
+    r._stale_list_streak = 0
     r._post_absent_pid = None
     r._post_absent_streak = 0
     r._post_absent_giveup = set()

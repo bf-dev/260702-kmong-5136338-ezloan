@@ -256,7 +256,10 @@ class App:
             seen_path = os.path.join(config.APP_DIR, "seen-posts.json")
             registrar = Registrar(cookies, log=self.log, remote=remote_log,
                                   should_stop=self._stop.is_set, seen_path=seen_path,
-                                  relogin=self._forced_relogin)
+                                  relogin=self._forced_relogin,
+                                  # 사이트 장애로 재시도 대기 중일 때 상태줄을 '사이트 응답 없음,
+                                  # 재시도 중...' 으로 바꾼다(예전엔 표시 없이 '정지됨' 이 됐다).
+                                  status=self.set_status)
             registrar.run()
         except Exception as e:
             import traceback

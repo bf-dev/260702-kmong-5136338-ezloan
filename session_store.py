@@ -65,18 +65,24 @@ def validate_saved_session():
     """저장된 쿠키로 requests 세션을 만들어 이지론 로그인 상태인지 확인.
 
     반환: (cookies, session) 유효하면 튜플, 아니면 (None, None).
-    ezloan_bot.logged_in() 과 동일한 로그인 판정을 재사용한다(중복 로직 방지).
+    ezloan_bot.login_state() 와 동일한 로그인 판정을 재사용한다(중복 로직 방지).
+
+    v2.6.1: '판정 불가'(사이트 다운/타임아웃/521)는 무효로 치지 않는다. 예전에는 여기서
+    False 가 나오면 저장된 세션을 버리고 크롬 창을 띄워 네이버 로그인을 다시 시켰는데,
+    사이트가 죽어 있는 동안엔 그 로그인도 성공할 수 없다. 세션을 그대로 넘겨주면 등록
+    루프(_ensure_session)가 사이트가 살아날 때까지 기다렸다 그대로 재개하고, 정말 만료된
+    세션이면 그때 로그아웃이 확인돼 정상적으로 재로그인 경로를 탄다.
     """
     cookies = load_cookies()
     if not cookies:
         return None, None
     try:
-        from ezloan_bot import session_from_cookies, logged_in
+        from ezloan_bot import session_from_cookies, login_state, LOGIN_OUT
     except Exception:
         return None, None
     try:
         s = session_from_cookies(cookies)
-        if logged_in(s):
+        if login_state(s) != LOGIN_OUT:
             return cookies, s
     except Exception:
         pass
