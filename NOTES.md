@@ -970,3 +970,112 @@ produced the 02:43 registration of 31238 earlier the same day.
   wall-clock and register() still reuses it as `precheck`. The v2.5.0/v2.5.1 blacklist regression
   is structurally impossible now anyway: the write only fires after the page is proven live, so
   `post_absent` is no longer the default state of the loop.
+
+## v2.6.1 (2026-08-23) — a 42-second site outage must not kill the worker
+
+### The incident (customer 5136338, 2026-08-22, running v2.5.5)
+
+ezloan.io went down for ~42 seconds at 04:55 UTC. The app stopped and stayed stopped for
+**17 hours 57 minutes**, missing every post in that window. The customer noticed the next day.
+The whole chain is in the ingest log, verbatim:
+
+```
+04:55:31 [frontier_resync] frontier=31985 > 실제최신(30104)+1+창 -> frontier=30105
+04:55:31 [register_skip] post=30103 status=521 note=check_http_error
+04:55:41 [register_skip] post=30088 status=521 note=check_http_error
+04:55:52 [register_skip] post=30103 status=521 note=check_http_error
+04:56:03 [register_skip] post=30103 status=521 note=check_http_error
+04:56:13 [register_skip] post=30088 status=521 note=check_http_error
+04:56:28 [run_error] urllib3.exceptions.ReadTimeoutError: ...ezloan.io:443 (read timeout=12)
+         ezloan_bot.py run -> _handle -> register -> _check
+04:56:38 [session_expired] loop 예외 후 세션 무효 확인      <- thread returns here
+```
+
+Two independent defects, both fixed in v2.6.1:
+
+1. **`logged_in()` was a boolean**, so "the site did not answer" and "the session expired"
+   were the same value. `run()`'s `except` asked `logged_in()` right after a timeout, got
+   `False`, emitted `session_expired` and `return`ed. `app.py:_run_registrar`'s `finally`
+   then set 정지됨 and re-enabled 시작. **Zero `run_stopped` rows were ever emitted** — that
+   absence is how you identify this exit path in a log.
+2. **Cloudflare served a cached `/rq` page while the origin was 521**. Its newest post was
+   30104 while the real frontier was 31985, so the frontier-runaway guard "resynced"
+   **backwards by 1,880 posts** and the list safety net then treated two-week-old posts as
+   new and started re-adding them (the 30088/30103 register_skips above). That path can
+   burn 배너잔여 on ancient posts.
+
+### What changed
+
+- `login_state(s, max_known_id=0)` returns **LOGGED_IN / LOGGED_OUT / UNKNOWN**.
+  Only a 200 that actually shows a logged-out state is LOGGED_OUT. Any non-200
+  (521/522/524/502/503/403/429), any exception, and any 200 whose body matches neither
+  marker set is UNKNOWN. `logged_in()` remains as a thin `== LOGIN_IN` wrapper; its `False`
+  no longer means "logged out" and must never be used to decide session death.
+  Logged-out markers verified live (2026-08-23, KR egress, anonymous GET /rq, HTTP 200,
+  294,680 bytes): no `로그아웃` / `광고 관리` anywhere, and `class="log in flex"` +
+  `<!-- // 비로그인 { -->` present. Live results:
+  `anonymous -> LOGGED_OUT`, `same page with max_known_id far ahead -> UNKNOWN`,
+  `521 -> UNKNOWN`, `read timeout -> UNKNOWN`.
+- `Registrar._ensure_session(reason)` replaces every `if not logged_in(): ... return` in
+  `run()` (startup check, the `_session_lost_streak >= 4` branch, and the loop's `except`).
+  UNKNOWN backs off 3s -> 30s **indefinitely** and resumes the instant the site answers;
+  LOGGED_OUT goes through the existing `self._forced_relogin` callback and only stops the
+  worker after `SESSION_RELOGIN_MAX_ATTEMPTS`, with `relogin_exhausted` logged. Every
+  remaining stop path now emits `run_stopped` with a reason.
+  The 30s cap is deliberate: that cap IS the maximum idle time after the site recovers.
+- GUI status line shows `사이트 응답 없음, 재시도 중...` while waiting (`Registrar(status=...)`
+  wired to `App.set_status`), instead of silently becoming 정지됨.
+- **Stale-list guard.** A list whose newest id is more than `STALE_LIST_MAX_LAG` (50) behind
+  the highest id we already confirmed (`self._max_live_id`) is not the current list: skip the
+  frontier resync AND the safety net, log `stale_list`. The same lag test inside
+  `login_state` prevents a cached anonymous page from being read as a logout (which would
+  otherwise pop a Chrome relogin window at the customer during every outage). If the
+  condition persists `STALE_LIST_ACCEPT_AFTER` (600) heavy ticks (~10 min) the new max is
+  accepted, so a genuine mass deletion cannot wedge it forever.
+- `session_store.validate_saved_session()` no longer discards a saved session just because
+  the site is unreachable (it only discards on a confirmed LOGGED_OUT). Otherwise a restart
+  during an outage forced a full Naver login that could not have succeeded anyway.
+
+### Restart catch-up (the 2026-08-05 open bug, now closed)
+
+`run()` used to absorb the entire current list into `seen` at startup, so anything published
+while the app was down was permanently skipped (live evidence: 10 of posts 31150-31244 had no
+banner, 31165-31174 + 31203). Now the absorb threshold is the **persisted seen max**
+(`prev_max`): ids <= prev_max are absorbed as before, ids > prev_max are left unseen so the
+list safety net registers them, capped at the newest `RESTART_CATCHUP_MAX` (10) so a multi-day
+outage cannot spend 배너잔여 on a pile of old posts. If `seen` is empty (fresh install) the old
+full-absorb behaviour is kept, otherwise the first run would try to register the whole list.
+
+### CI gates added (both fail on v2.6.0 @ 45527eb, verified with `git worktree`)
+
+```
+repro_site_outage_no_session_kill.py
+  v2.6.0: frontier_resync 1, session_expired 1, worker dead at t=39.9s, new post never registered
+  v2.6.1: site_unreachable 1, site_recovered 1, session_expired 0, stale_list 3,
+          frontier_resync 0, new post 31985 registered 0.05s after it went live
+repro_restart_missed_posts.py
+  v2.6.0: 0 of 10 posts published during the restart registered
+  v2.6.1: 10/10 registered, 0 re-adds of pre-restart posts; long-outage case capped at 10 newest
+```
+
+### Build / hosting (v2.6.1)
+
+GitHub Actions run 32604642191 on `main`, all 12 verify/repro steps green.
+`file` -> `PE32+ executable (GUI) x86-64`. GUI screenshot from the Windows runner:
+`/home/bfdev/workspace/kmong/tmp/ezloan-261/windows-verification.png` (no layout change vs
+v2.6.0; the only visible difference is the new outage status line at runtime).
+
+```
+https://works.insu.ng/works/public/5136338/ezloan-desktop-2.6.1.exe    (canonical, versioned)
+https://works.insu.ng/works/public/5136338/ezloan-desktop-260823.exe   (delivery link, no version number)
+```
+
+Both verified 200 with a cache-busting query and md5 7e73b087f2090abe926144b4a6ddeda1 ==
+the built artifact (33,466,164 bytes). `AUTO_UPDATE_ENABLED` is still False and
+`version-ezloan-desktop.json` was deliberately NOT touched, so nothing self-updates:
+v2.6.1 only reaches the customer when the owner sends the link.
+The customer is still on v2.5.5. v2.6.0 was built and hosted but never delivered, so v2.6.1
+carries the v2.6.0 detection work (read-gated hot path) with it.
+
+Artifacts API untouched and re-verified end to end: a POST in bridge.py's exact payload shape
+with `source: ezloan-desktop-v2.6.1` returned `200 {"success":true,"matched":true}`.
