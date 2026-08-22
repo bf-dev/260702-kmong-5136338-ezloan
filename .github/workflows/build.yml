@@ -71,6 +71,22 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_steady_state_detect_lag.py
 
+      # 2026-08-23 (v2.6.1): 2026-08-22 사고 재현. 사이트가 42초 죽었을 때(521 x5 ->
+      # ReadTimeout, 그 사이 Cloudflare 가 캐시된 옛 목록을 200 으로 대신 내려줌) 등록
+      # 스레드가 죽으면 안 된다. v2.6.0 이하에서는 실제로 실패한다(session_expired 를 쏘고
+      # run() 이 빠져나가 회복 후의 새 글을 등록하지 못한다).
+      - name: Verify a site outage does not kill the worker (2026-08-22 incident)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_site_outage_no_session_kill.py
+
+      # 2026-08-23 (v2.6.1): 재시작 중에 올라온 글을 영구히 건너뛰던 버그(2026-08-05 실측
+      # 배너 누락 10건)의 게이트. v2.6.0 이하에서는 0건 등록으로 실패한다.
+      - name: Verify posts published during a restart are not skipped (2026-08-05 open bug)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_restart_missed_posts.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8
