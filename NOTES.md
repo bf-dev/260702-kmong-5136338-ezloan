@@ -1367,3 +1367,198 @@ md5           eb5ad768c6b670f4727586c3788ae69b   33473821 bytes
 `AUTO_UPDATE_ENABLED` stays **False**, `version-ezloan-desktop.json` untouched (still points
 at 2.5.4), and `ezloan-desktop-2.6.1.exe` / `ezloan-desktop-260823.exe` were left in place.
 The customer installs 2.6.2 by hand, like every version since the 2.5.3 auto-swap incident.
+
+---
+
+## 2026-08-23 — WHERE WE ACTUALLY LAND, and who 옥자대부 really is
+
+Three things in this section, in the order they were measured. The first one invalidates a
+month of logs, so read it before trusting any earlier `rank=` number in this file.
+
+### 0. 더원대부 IS OUR CUSTOMER. 옥자대부 is the competitor.
+
+`config.COMPANY_NAME = "더원대부"`, advertiser id **585**, is customer 5136338 themselves.
+Any note or scan that reads "더원대부 in slot 1 on N of N posts" is saying WE were slot 1,
+not that a rival was. The rival the customer keeps naming, 옥자대부, is advertiser **544**.
+
+### 1. The `rank=1` in every log since v2.4.6 was wrong (parser bug, now fixed)
+
+`company_rank()` matched banner items with
+
+```
+<a href="/l/\d+" class="item[^"]*"[^>]*>\s*<div class="name">([^<]*)</div>
+```
+
+A paid-tier advertiser (`class="item ad_sm"` / `ad_lg`) renders a badge span inside that div:
+
+```
+<div class="name">옥자대부 <span class="m_hide">정식등록 8개월</span></div>
+```
+
+`([^<]*)</div>` cannot match that, so **every ad_sm/ad_lg advertiser was invisible to the
+rank counter**. On post 32004 that is 4 of the 9 banners, and one of them is 옥자대부. So on
+posts where 옥자대부 sat at slot 1 and we were slot 2, the log still printed `rank=1`.
+Fixed by reading the 상호 from the `<a title>` attribute (always present, no children) and
+scoping the scan to the real `<ul class="section_body loan_list recommend">`
+(`banner_order()` / `rank_and_above()` in `ezloan_bot.py`). `verify_register_latency.py`'s
+fixture now uses the real markup with a badge span, so this class of bug fails CI.
+
+### 1b. Achieved slot, measured live (anonymous GETs, KR egress 13.124.160.237)
+
+`rank_audit.py 31940 32004` (dense) and a step-10 sweep of 31000-32004 (sparse):
+
+```
+dense 31940-32004   60 posts rendered, our 585 on 48
+                    real slot 1 :  1  (post 32004)
+                    real slot 2 : 38
+                    real slot 3 :  4
+                    real slot 5/7/10/11 : 5 (late manual adds during the PC outage)
+                    who is above us on the 47 losses: 옥자대부(544) 47/47
+
+sparse 31000-32004  89 posts where 옥자대부 appears -> 옥자대부 is slot 1 on 89 of 89
+                    our 585 reaches slot 1 on exactly 3: 31040, 31240, 31530
+                    31240 / 31530 are posts 옥자대부 is simply not on
+                    31040 is a genuine head-to-head win (544 at slot 2)
+```
+
+So over ~1000 posts of history the honest number is: **we are slot 2, essentially always,
+and we have beaten 옥자대부 head to head twice (31040, and 32004 today).** The app was
+reporting 1등 for all of it.
+
+The 2026-08-21/22 desktop run (v2.5.5) logged `rank=1` on 43 consecutive posts. Real slot:
+2 on 38 of them, 3 on 4. Zero 1등.
+
+### 2. The competitor's actual timing (this is the number that matters)
+
+`race_watch.py` / `race_watch_kr.py` sit on the next unpublished post id, poll it
+anonymously, and timestamp the moment each banner appears. Post 32005:
+
+```
+t = 0.000   /rq/32005 first renders with its banner <ul>   (banner list EMPTY)
+t = 0.140   옥자대부 (544) present, alone
+t = 7.948   서일대부 (545)          <- the next competitor, 7.8 SECONDS later
+t = 8.573   24시월변대부중개 (607)
+t = 9.215   미라클월변대부중개 (408)
+t = 9.858   전국한마음대부중개 (310)
+t = 10.480  헤븐금융대부 (330)
+t = 16.870  쉽고빠르게대부중개 (535)
+final: 7 banners, ours (585) ABSENT
+publish bracket <= 0.25s (last "not yet" observation 0.25s before t=0)
+```
+
+Read that carefully. **The field is not fast at all.** Second place shows up nearly 8
+seconds after the post opens. Only 옥자대부 is in the millisecond game, landing within
+0-390ms of the open (140ms after we could first see the page, bracket 250ms).
+
+That also explains the whole v2.5.5 history: its detector was write-throttled with a
+0-5.7s backoff (mean ~2.9s), which is comfortably ahead of the 8s crowd and comfortably
+behind 옥자대부 -> **slot 2 on every single post, deterministically.** It was never a
+coin flip we were losing; we were never in the race.
+
+There is no push channel to be jealous of: `/res/js/script.js` has no WebSocket, no
+EventSource, no FCM/OneSignal, no service worker, and the origin is plain nginx with no
+cache headers on `/rq/{id}`. 옥자대부 is a poller sitting in Korea, and 140ms is exactly
+what a ~0.1s tick plus two ~44ms Korean round trips costs. It is beatable.
+
+### 3. We were also throwing posts away outright (32005, fixed)
+
+```
+03:07:37.778  our bot: post_live=True -> rq_addbanner_check -> {result:false,"no permission"}
+              old code: no_permission is NON_RETRYABLE -> seen.add + frontier advance
+03:07:56.208  /rq/32005 first renders with its banner <ul>   (= registration opens)
+03:07:56.35   옥자대부 registers
+final         we are not on the post at all
+```
+
+ezloan allocates the post id and serves a partial `/rq/{id}` page **18.4 seconds before
+banner registration opens**. `post_live()` (>=1000 bytes + `rq_addbanner` marker) goes true
+in that window; `rq_addbanner_check` answers `no permission` because the post is not open
+yet, not because anything is wrong with the account. This is the identical mistake that was
+already fixed for `post_absent` on 2026-07-27.
+
+Fix: `no_permission` is out of `NON_RETRYABLE`. The loop now holds the post id for
+`NO_PERM_RETRY_SECONDS` (90s), re-polls the 47-byte check every fast tick (a read, so no
+배너잔여 is spent and no write is fired), registers on the tick it opens, and only then
+falls back to the old give-up plus account hint. Gate: `repro_no_permission_not_open_yet.py`
+(fails at cycle 0 on v2.6.2). The side effect is the prize: **when we detect a post before
+it opens we are already waiting at the door**, so the register delay collapses to one check
+tick instead of detection lag plus a full round trip.
+
+Note this also retires the 2026-07-21 "ezloan account-side time/quota window" theory for
+"배너가 안 올라감". At least part of that was this bug.
+
+### 4. The latency budget, measured (warm keep-alive, p50)
+
+```
+leg                              this host -> SOCKS -> external-1     external-1 direct
+static asset (network floor)                       ~46 ms                   2.7 ms
+/rq/{future}  miss, 215 B                          90.0 ms                 52.2 ms
+/rq/{live}    35 KB gzipped                       139.2 ms                 81.5 ms
+/api/rq_addbanner_check                            83.2 ms                 43.9 ms
+```
+
+The gateway host is in **Tokyo** (Contabo, 46.250.255.29); the tunnel to external-1 (AWS
+Seoul) costs **~40 ms per round trip**, and the hot path uses two of them. Note also that
+~49 ms of the 52 ms miss is ezloan's own PHP render time (the static asset proves the
+network is 2.7 ms), so there is no client-side trick that gets below ~44 ms per call.
+
+publish/open -> our rq_addbanner reaches ezloan = `U(0, FRONTIER_POLL_SECONDS)` +
+live-page probe RTT + write RTT:
+
+```
+config                                              mean      best     worst   req/s
+today: Tokyo+tunnel, tick 0.15, window 2            297 ms    192      372     13.3
+external-1, tick 0.15, window 2                     201 ms    126      276     13.3
+external-1, tick 0.05, window 1                     151 ms    126      176     20.0
+external-1, tick 0.05, window 1, 2 staggered        138 ms    126      164     40.0
+floor (tick -> 0)                                   126 ms
+opponent 옥자대부                                   <=140 ms (measured, post 32005)
+```
+
+The earlier session was right that 25 ms of tick was noise when the gap was seconds. It is
+not noise now: the whole remaining margin is 160 ms and the opponent sits at 140 ms.
+
+Ranked by ms-per-unit-of-risk:
+
+1. **Run the bot ON external-1 instead of tunnelling to it. -96 ms, zero extra requests.**
+   This is the single biggest item and it costs nothing. `server_run.py` already takes its
+   egress from env; on external-1 `EGRESS_PROXY` is empty and it talks to ezloan directly.
+2. **`FRONTIER_POLL_SECONDS` 0.15 -> 0.05, `PROBE_WINDOW` 2 -> 1. -50 ms**, request rate
+   13.3 -> 20 /s. Window 2 only exists to catch a skipped post id, and the 1 s list safety
+   net already covers that within a second.
+3. **The pre-open wait (section 3) is worth more than either** on any post where ezloan
+   opens the id late, because it removes detection entirely from the path.
+4. Staggered pollers: strictly worse than just halving the tick (same mean, double the
+   requests). Do not bother unless a single poller starts showing head-of-line stalls.
+5. Not done, needs an explicit decision: **blind pre-fire.** While a post id is detected but
+   not yet open, fire `rq_addbanner` every tick instead of polling the check first. A
+   refused write costs no 배너잔여 (that is exactly what v2.4.6-v2.5.5 did as its detector,
+   ~15,000 writes/day, and ezloan tolerated it). It removes the check round trip and lands
+   us at ~47 ms from the open, which beats 140 ms outright. Cost: ~50-100 extra writes per
+   post, ~3-6k/day at the current 30-60 posts/day, i.e. within the historical envelope but
+   a real change in the account's write profile. Worth doing only with the owner's sign-off.
+
+### 5. Honest answer to "is 1등 reachable"
+
+Yes, and nothing about the platform prevents it. The opponent is a poller with no
+privileged channel, measured at <=140 ms, and everyone else in the field is 8+ seconds
+behind. Our current 297 ms is a machine-placement problem (Tokyo, tunnelled) plus a tick
+that was tuned when the gap was seconds. Items 1+2 alone put the mean at 151 ms, which is
+a genuine coin flip against 140 ms rather than the near-certain loss it is today; item 3
+wins outright on every post ezloan opens late; item 5 wins outright everywhere.
+
+What is NOT claimed: nobody has yet observed us take slot 1 against a live 옥자대부 more
+than twice (31040, 32004). The competitor number is one post (32005) at 140 ms; more
+samples are being collected by `race_watch_kr.py` on external-1.
+
+### Tools added (all read-only, all anonymous, none of them log in or write)
+
+```
+rank_tools.py        shared parser + KR-egress probe session
+rank_audit.py        achieved-slot audit over a band of posts
+race_watch.py        live arrival-time watcher (runs here, through the tunnel)
+race_watch_kr.py     same, stdlib only, meant to run ON external-1 (~27 ms resolution)
+```
+
+Evidence kept at `/home/bfdev/workspace/kmong/tmp/ezloan-race/` (tmp is pruned in 14 days;
+the numbers that matter are in this file).
