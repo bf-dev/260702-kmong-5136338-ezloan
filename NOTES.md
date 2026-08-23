@@ -2127,3 +2127,85 @@ join so the page-truth slots cover the newest posts.
 32023 as of 07:28Z. Leave it: it is the only thing growing N. Stop only with
 `ssh unicorn@external-2 'crontab -r'` then `pkill -f race_sampler` from a plain shell (not
 inside a one-line `ssh 'a; b; c'`, which kills its own ssh).
+
+### 19:47Z (2026-08-23, overnight re-audit) — N almost triples, CI still ~1pp short of ±15
+
+Bounded re-run, no changes to the live loop. Confirmed both background processes first:
+
+- **Sampler alive and current.** Same pid, `unicorn@external-2` 677182 (parent flock
+  677178), `ELAPSED 13:04:03` at check time, no restart since the process came up
+  yesterday, cron watchdog (`*/2`) never had to fire. `state.json` was current
+  (`next_post: 32041, updated: 17:05:32Z`) and the process was `S`/`futex_wait_queue`
+  (idle-polling, not hung) when checked at 19:40Z. It had simply been waiting almost
+  2.5h for post 32041 to be allocated, which is correct: ezloan posted nothing new in
+  that window (see below), not a sampler failure.
+- **Live loop alive and current.** `unicorn@external-8` pid 1532521 (`remote_loop.py`),
+  `lstart` Aug23 13:56:31 KST == **04:56:31Z**, i.e. it is the same process from the
+  04:56Z restart with zero interruptions since (14h47m uptime at check time). Source
+  `ezloan-server-v2.6.1` was logging cycles every ~10s right up to the check
+  (`#49189` at 19:41:34Z). **Do not confuse `frontier=` in the cycle log with "post
+  exists"**: it is the next post id being probed, and it held at 32041 for 2.5h simply
+  because ezloan had not allocated that id yet (`새글=0` the whole time) — 04:40-ish
+  KST is a quiet overnight window for new posts, not a stall.
+- **Mid-task, ezloan posted again.** Post 32041 allocated and registered live at
+  19:44:17Z (`등록` 27->28, `배너잔여` 450->449), captured by both the loop and the
+  sampler in real time. Page-read independently at 19:46:37Z: `585` slot 1, `544`
+  slot 2 — a 27th regime-C head-to-head win. Folded into the numbers below.
+
+**Sample growth: 63 -> 83 audited posts** (`out/260823_full/slot_audit_combined.jsonl`,
+concatenation of the existing 31960-32022 audit + a fresh `slot_audit_kr.py 32023 32041`
+pass off external-2 + the single-post 32041 pass after it went live). Two posts' pages
+had already expired by audit time (32035, 32039) and were filled in from the sampler's
+own real-time `race_summary.jsonl` capture instead of left as gaps.
+
+**Regime win-rate table, recomputed (Wilson 95% CI, page-truth `slot_ours < slot_rival`):**
+
+```
+regime                                          posts  h2h  wins   rate    95% CI
+A  customer PC, v2.5.5 (Windows, home net)      31960-31984   23    0    0.0%   [ 0.0%, 14.3%]
+B  server run, before the 04:56Z restart        32003-32014    8    1   12.5%   [ 2.2%, 47.1%]
+C  server run on external-8, direct KR egress   32015-32041   26   20   76.9%   [57.9%, 89.0%]
+```
+
+Fisher exact, C (20/26) vs A+B (1/31): **p = 7.1e-9** — the regime effect is not noise,
+more decisively than yesterday's p=0.0022 now that N tripled.
+
+**Verdict on the ±15pp target: not quite there yet, but close.** Regime C's Wilson
+interval is **[57.9%, 89.0%]**, half-width **15.5 percentage points** — about 0.5pp over
+the ±15pp bar set yesterday. At the current ~77% win rate, the half-width crosses under
+15pp at roughly **n=28-30 head-to-head posts** (currently n=26); at the observed post
+cadence (posts every 15-70 min once ezloan is actively posting, slower overnight) that is
+**a handful more posts, realistically within today**, not another full day. **Do not
+quote a percentage to the customer yet** — it is a ~1-day-old regime with n=26, on the
+edge of usable but not over it. The honest sentence remains the one from yesterday:
+"지금 설정에서 옥자대부를 실제로 몇 번 눌렀고, 비율은 조금 더 데이터를 모아야 확정해서
+말씀드릴 수 있습니다."
+
+**배너잔여 (banner credit) drain rate.** Traced every credit-decrementing cycle line
+back to the loop's last cold start (`#1` at 2026-08-23T01:56:06.399Z, 485 credits,
+before the 04:56Z restart onto external-8 — the restart did not reset the balance, it is
+account-side). 37 decrements since then, monotonic, no top-ups observed. Latest reading:
+**449 at 19:44:27.925Z** (the post-32041 registration).
+
+```
+485 -> 449 = 36 credits drained over 17.806h  =>  2.02 credits/hour
+projected days to zero at this rate: 449 / 2.02 / 24 = 9.25 days
+```
+
+(Using the task's stated 19:38Z/450 snapshot instead: 35 credits / 17.698h = 1.98/h,
+9.48 days — same conclusion within rounding.) **~9 days to zero at the current pace.**
+Worth a heads-up to the customer soon but not urgent tonight; flag if it drops under
+~3-4 days remaining (roughly under 200 remaining, unless the rate changes with post
+volume).
+
+**Where the new data lives:** `out/260823_full/` in this repo — `slot_audit_31960_32022.jsonl`
+(carried over), `slot_audit_32023_32041.jsonl` (new pass, `unicorn@external-2`, uploaded
+to Artifacts API `ezloan-race-slotaudit`), `slot_audit_combined.jsonl` (both + the 32041
+single-post re-check, 83 rows, this is what the regime table above was computed from),
+`race_summary.jsonl` / `race_detail.jsonl` (sampler's own real-time capture, 24-25 rows,
+also uploaded). The regime cutoffs (A/B/C) are unchanged from yesterday's NOTES; only C's
+upper bound moved from 32022 to 32041. Next session: re-run
+`slot_audit_kr.py <last_audited+1> <new frontier>` on external-2, concatenate onto
+`slot_audit_combined.jsonl`, and recompute the table above with the same regime cutoffs —
+should not need a new regime letter unless the loop is restarted again or moved off
+external-8.
