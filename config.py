@@ -48,12 +48,38 @@ NAVER_LOGIN_URL = "https://nid.naver.com/nidlogin.login?locale=ko_KR"
 # (예전 하루 약 1.5만 회 -> 하루 약 40회).
 # 실측(2026-08-05, KR egress unicorn@external-8): 웜 keep-alive 로 /rq/{미존재} p50 46.8ms,
 # p90 50.2ms. 10 req/s 를 30초간 쏴도 301/301 전부 200, 지연 증가/차단/429 없음.
-FRONTIER_POLL_SECONDS = 0.15  # 존재 확인 tick 주기(절대 스케줄) - 새 글 감지 지연 상한.
+# 2026-08-23: 아래 두 값만 환경변수로 덮어쓸 수 있게 열어 둔다. 기본값은 예전 그대로라
+# 고객 PC 의 exe 동작은 한 글자도 바뀌지 않는다. 서버 사이드 실행(server_run.py)에서만
+# 값을 조인다 - 서버는 한국(external-1)에서 직접 돌기 때문에 왕복이 절반이라 tick 을
+# 좁혀도 초당 요청 수가 감당 범위 안에 남는다. 자세한 산수는 NOTES.md 참고.
+def _env_float(name, default):
+    try:
+        v = float(os.environ.get(name, "").strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _env_int(name, default):
+    try:
+        v = int(os.environ.get(name, "").strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+FRONTIER_POLL_SECONDS = _env_float("EZLOAN_FRONTIER_POLL_SECONDS", 0.15)
+# 존재 확인 tick 주기(절대 스케줄) - 새 글 감지 지연 상한.
 # 매 fast tick 에 '동시에' 찔러 볼 글 번호 개수(frontier, frontier+1, ...).
 # 실제 글 번호는 거의 항상 연속이고 아주 가끔 하나를 건너뛰므로(실측: 31222 -> 31224),
 # 창 2면 건너뛴 번호도 지연 없이 잡힌다. 요청은 스레드로 병렬 발사되므로 tick 의 벽시계
 # 비용은 창 크기와 무관하게 1왕복이다. 창 전체(LOOKAHEAD)는 무거운 tick 에서만 훑는다.
-PROBE_WINDOW = 2
+# 창을 1 로 줄여도 건너뛴 번호는 무거운 tick(1초마다, width=LOOKAHEAD=6)이 1초 안에 잡는다.
+PROBE_WINDOW = _env_int("EZLOAN_PROBE_WINDOW", 2)
+# tick 대비 스케일 계수. 아래의 'tick 개수'로 표현된 상수들은 전부 tick 0.15s 기준으로
+# 튜닝된 값이라, tick 을 좁히면 벽시계 기준 방어선이 같이 짧아져 버린다. 이 계수를 곱해
+# 벽시계 타이밍(32s / 4s / 9.75분)을 tick 값과 무관하게 고정한다.
+_TICK_SCALE = 0.15 / FRONTIER_POLL_SECONDS
 LIST_POLL_SECONDS = 1.0       # 목록(/rq, 309KB) fetch + 안전망 + 프런티어 재동기화 주기.
 # 구버전 POLL_SECONDS 는 auth_mismatch backoff 의 기준값(그리고 하위호환 fallback)으로만 남긴다.
 # 위 두 값으로 분리되기 전에는 이게 유일한 루프 주기였다(v2.4.6~v2.5.4).
@@ -85,7 +111,7 @@ NO_PERM_RETRY_SECONDS = 90.0
 # 예전처럼 '대기 상태의 기본값'이 아니라 진짜 찰나의 경쟁일 때만 생기는 드문 상태다.
 # 그래도 벽시계 타이밍은 v2.5.x 와 동일하게 유지하려고 tick 0.2s -> 0.15s 만큼 재스케일했다:
 #   3900 * 0.15s ≈ 9.75분(= 2000 * 0.2s 와 사실상 동일한 방어선).
-POST_ABSENT_GIVEUP_STREAK = 3900
+POST_ABSENT_GIVEUP_STREAK = int(round(3900 * _TICK_SCALE))
 # v2.5.2 (2026-07-27, 운영자 지시 - 유료 "1등 등록속도" 는 유지하되 더 보수적으로): 위
 # post_absent 재시도는 FAST_RETRY 구간 동안 매 사이클 rq_addbanner(WRITE)를 다시 쏜다.
 # 실측(2026-07-27, 고객 5136338)상 정상적인 페이지-반영 지연은 길어야 수초~수십초였으므로,
@@ -100,8 +126,8 @@ POST_ABSENT_GIVEUP_STREAK = 3900
 # 페이지가 뜨는 순간을 그만큼 더 빨리 잡는다(이게 바로 이번 튜닝의 핵심 이득).
 # v2.6.0: tick 이 0.15s 가 되었으므로 벽시계 기준으로 같은 32s / 4s 가 되게 다시 스케일한다.
 # (이 구간이 실제로 쓰이는 빈도 자체는 v2.6.0 에서 크게 줄었다 - 위 GIVEUP 주석 참고.)
-POST_ABSENT_FAST_RETRY_CYCLES = 213   # 0.15s * 213 ≈ 32s. 매 tick 즉시 재시도(속도 유지 구간).
-POST_ABSENT_BACKOFF_INTERVAL = 27     # 그 이후엔 27tick(≈4s)마다 한 번만 실제 재시도.
+POST_ABSENT_FAST_RETRY_CYCLES = int(round(213 * _TICK_SCALE))  # ≈32s. 매 tick 즉시 재시도.
+POST_ABSENT_BACKOFF_INTERVAL = max(1, int(round(27 * _TICK_SCALE)))  # ≈4s 마다 한 번만 재시도.
 
 # --- 사이트 장애(응답 없음) 재시도 --------------------------------------------
 # 2026-08-22 사고: ezloan.io 가 42초간 죽었을 때(521 x5 -> read timeout) 앱이 그걸

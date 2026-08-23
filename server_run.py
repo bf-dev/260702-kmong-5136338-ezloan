@@ -279,6 +279,9 @@ def _run_child(args, creds):
             f"ezloan.io=200 through the tunnel")
         write_state(egressIp=ip, egressCountry=country, hostIp=own,
                     sshHost=args.ssh_host, socksPort=args.socks_port,
+                    loopHost=args.loop_host or "(this host, via the tunnel)",
+                    loopExpectIp=args.loop_expect_ip or None,
+                    loopTick=args.loop_tick or None, loopWindow=args.loop_window or None,
                     dryRun=bool(args.dry_run), startedAt=time.time(), pid=os.getpid())
 
         def on_egress_violation(reason):
@@ -308,14 +311,24 @@ def _run_child(args, creds):
             cookies = _login(args, creds, should_stop, log, remote, ip)
             if cookies is None:
                 rc = 4
+            elif args.loop_host:
+                # The hot loop runs IN Korea; the login stayed here. If the remote cannot
+                # be kept alive we fall back to running it here through the tunnel, which
+                # is slower but is exactly what we did before, so a broken loop host
+                # degrades the latency instead of taking the customer's run offline.
+                ok = _run_remote_loop(args, creds, cookies, ip, should_stop, stop_event,
+                                      log, remote)
+                if not ok and not should_stop():
+                    log("[loop] falling back to running the loop HERE through the tunnel")
+                    remote("loop_host_fallback",
+                           f"{args.loop_host} 에서 루프를 유지하지 못해 게이트웨이(터널 경유)로 "
+                           f"되돌립니다. 등록은 계속되지만 등록 지연이 커집니다.", force=True)
+                    registrar = _local_registrar(args, creds, cookies, ip, should_stop,
+                                                 log, remote)
+                    registrar.run()
             else:
-                seen_path = os.path.join(config.APP_DIR, "seen-posts.json")
-                registrar = Registrar(
-                    cookies, log=log, remote=remote, should_stop=should_stop,
-                    seen_path=seen_path,
-                    relogin=lambda: _login(args, creds, should_stop, log, remote, ip,
-                                           forced=True),
-                    status=lambda t: log(f"[status] {t}"))
+                registrar = _local_registrar(args, creds, cookies, ip, should_stop,
+                                             log, remote)
                 registrar.run()
         if fatal["reason"]:
             rc = 5
@@ -345,6 +358,222 @@ def _run_child(args, creds):
         except Exception:
             pass
     return rc
+
+
+def _local_registrar(args, creds, cookies, ip, should_stop, log, remote):
+    """The Registrar running HERE, through the SOCKS tunnel. The original path."""
+    import config
+    from ezloan_bot import Registrar
+
+    return Registrar(
+        cookies, log=log, remote=remote, should_stop=should_stop,
+        seen_path=os.path.join(config.APP_DIR, "seen-posts.json"),
+        relogin=lambda: _login(args, creds, should_stop, log, remote, ip, forced=True),
+        status=lambda t: log(f"[status] {t}"))
+
+
+# --------------------------------------------------------- the loop, run in Korea
+LOOP_FILES = ("remote_loop.py", "ezloan_bot.py", "config.py", "egress.py", "bridge.py",
+              "session_store.py")
+
+# remote_loop.py exit codes (kept in sync with that file)
+_LOOP_EXIT_OK = 0
+_LOOP_EXIT_SESSION_DEAD = 4
+_LOOP_EXIT_EGRESS = 5
+
+
+def _deploy_loop(args, log):
+    """Push the loop's source to the Korean node. Plain tar over ssh: no rsync there."""
+    import tarfile
+    import io
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in LOOP_FILES:
+            tar.add(str(HERE / name), arcname=name)
+    payload = buf.getvalue()
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+           "-o", "ConnectTimeout=20", args.loop_host,
+           f"mkdir -p {args.loop_dir} && tar xzf - -C {args.loop_dir}"]
+    p = subprocess.run(cmd, input=payload, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError(f"deploy to {args.loop_host} failed rc={p.returncode}: "
+                           f"{(p.stdout or b'').decode('utf-8', 'replace')[:400]}")
+    log(f"[loop] deployed {len(LOOP_FILES)} files to {args.loop_host}:{args.loop_dir} "
+        f"({len(payload)} bytes)")
+
+
+def _read_seen():
+    try:
+        return list(json.loads((RUN_DIR / "seen-posts.json").read_text()).get("seen") or [])
+    except Exception:
+        return []
+
+
+def _write_seen(obj):
+    try:
+        tmp = RUN_DIR / "seen-posts.json.tmp"
+        tmp.write_text(json.dumps(obj, ensure_ascii=False))
+        tmp.replace(RUN_DIR / "seen-posts.json")
+    except Exception:
+        pass
+
+
+def _run_remote_loop(args, creds, cookies, ip, should_stop, stop_event, log, remote):
+    """Supervise one Registrar loop running on the Korean node. Returns True if it ended
+    because we asked it to, False if it died in a way that needs the local fallback.
+
+    Two invariants this function exists to hold:
+
+      1. EXACTLY ONE loop is live. The remote is launched over a single ssh whose stdin we
+         hold open and heartbeat; the remote exits on its own if the heartbeat stops, so an
+         ssh that dies badly cannot leave an orphan racing the same ezloan session.
+      2. The gateway's copy of `seen` never falls behind the remote's, because the remote
+         mirrors it down on every change. A fallback to the local loop therefore does not
+         re-register posts the remote already did.
+    """
+    import config
+
+    if not args.loop_expect_ip:
+        log("[loop] --loop-host given without --loop-expect-ip; refusing to start a "
+            "remote loop with no pinned Korean address")
+        return False
+
+    try:
+        _deploy_loop(args, log)
+    except Exception as e:
+        log(f"[loop] {redact(str(e))}")
+        return False
+
+    env_overrides = {"EZLOAN_REMOTE_SOURCE": os.environ.get("EZLOAN_REMOTE_SOURCE", "")}
+    if args.loop_tick:
+        env_overrides["EZLOAN_FRONTIER_POLL_SECONDS"] = args.loop_tick
+    if args.loop_window:
+        env_overrides["EZLOAN_PROBE_WINDOW"] = args.loop_window
+
+    attempts = 0
+    max_attempts = 5
+    while not should_stop():
+        payload = {
+            "cookies": cookies,
+            "expect_ip": args.loop_expect_ip,
+            "expect_country": args.expect_country,
+            "guard_interval": args.guard_interval,
+            "app_dir": f"{args.loop_dir}/state",
+            "remote_source": os.environ.get("EZLOAN_REMOTE_SOURCE", ""),
+            "env": env_overrides,
+            "seen": _read_seen(),
+        }
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+               "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15",
+               "-o", "ServerAliveCountMax=3", "-o", "TCPKeepAlive=yes",
+               args.loop_host,
+               f"cd {args.loop_dir} && exec python3 -u remote_loop.py"]
+        log(f"[loop] starting the Registrar on {args.loop_host} "
+            f"(pinned egress {args.loop_expect_ip}, attempt {attempts + 1}/{max_attempts})")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=1, text=True,
+                                encoding="utf-8", errors="replace")
+        try:
+            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except Exception as e:
+            log(f"[loop] could not hand the remote its startup payload: {e}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            attempts += 1
+            if attempts >= max_attempts:
+                return False
+            time.sleep(5)
+            continue
+
+        exit_code = {"v": None, "reason": ""}
+        started = time.time()
+
+        def _beat():
+            """Heartbeat + stop signal. The remote dies on its own if this stops."""
+            while proc.poll() is None:
+                if should_stop():
+                    try:
+                        proc.stdin.write("STOP\n")
+                        proc.stdin.flush()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    proc.stdin.write("PING\n")
+                    proc.stdin.flush()
+                except Exception:
+                    return
+                time.sleep(10)
+
+        beat = threading.Thread(target=_beat, name="ezloan-loop-beat", daemon=True)
+        beat.start()
+
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if line.startswith("@@LOG "):
+                log("[kr] " + line[6:])
+            elif line.startswith("@@SEEN "):
+                try:
+                    _write_seen(json.loads(line[7:]))
+                except Exception:
+                    pass
+            elif line.startswith("@@EXIT "):
+                bits = line[7:].split(" ", 1)
+                try:
+                    exit_code["v"] = int(bits[0])
+                except Exception:
+                    exit_code["v"] = None
+                exit_code["reason"] = bits[1] if len(bits) > 1 else ""
+            elif line.strip():
+                log("[kr!] " + line[:400])
+
+        proc.wait(timeout=30)
+        rc = exit_code["v"] if exit_code["v"] is not None else proc.returncode
+        uptime = time.time() - started
+        log(f"[loop] the remote loop exited rc={rc} after {uptime:.0f}s "
+            f"({exit_code['reason'] or 'no reason reported'})")
+
+        if should_stop():
+            return True
+        if rc == _LOOP_EXIT_OK:
+            # It ended cleanly without us asking. Treat as a restart, not a fallback.
+            attempts += 1
+        elif rc == _LOOP_EXIT_SESSION_DEAD:
+            log("[loop] the remote says the ezloan session is dead; re-logging in here")
+            remote("loop_relogin", "KR 루프가 세션 만료를 보고해 게이트웨이에서 재로그인합니다.",
+                   force=True)
+            fresh = _login(args, creds, should_stop, log, remote, ip, forced=True)
+            if not fresh:
+                log("[loop] re-login failed; handing back to the local loop")
+                return False
+            cookies = fresh
+            attempts = 0          # a successful re-login is progress, not a failure
+            continue
+        elif rc == _LOOP_EXIT_EGRESS:
+            # The Korean node's own address moved or became unverifiable. Do NOT retry it:
+            # the whole point of the pin is that we stop instead of guessing.
+            log("[loop] the remote refused on egress grounds; not retrying that host")
+            return False
+        else:
+            attempts += 1
+
+        # A loop that stayed up for a good while and then died is worth restarting; one
+        # that dies immediately, repeatedly, is a broken host.
+        if uptime > 300:
+            attempts = 1
+        if attempts >= max_attempts:
+            log(f"[loop] {attempts} consecutive failures on {args.loop_host}")
+            return False
+        delay = min(30.0, 3.0 * (2 ** (attempts - 1)))
+        log(f"[loop] retrying in {delay:.0f}s")
+        if stop_event.wait(delay):
+            return True
+    return True
 
 
 def _dry_run_loop(args, should_stop, log, remote):
@@ -638,6 +867,14 @@ def cmd_start(args):
             "--expect-ip", args.expect_ip, "--expect-country", args.expect_country,
             "--guard-interval", str(args.guard_interval),
             "--captcha-timeout", str(args.captcha_timeout)]
+    if args.loop_host:
+        argv += ["--loop-host", args.loop_host,
+                 "--loop-expect-ip", args.loop_expect_ip,
+                 "--loop-dir", args.loop_dir]
+        if args.loop_tick:
+            argv += ["--loop-tick", str(args.loop_tick)]
+        if args.loop_window:
+            argv += ["--loop-window", str(args.loop_window)]
     if args.dry_run:
         argv += ["--dry-run"]
         if args.dry_seconds:
@@ -736,6 +973,10 @@ def cmd_status(args):
         print(f"egress    : {state.get('egressIp')} ({state.get('egressCountry')}) "
               f"via {state.get('sshHost')}:{state.get('socksPort')}")
         print(f"host ip   : {state.get('hostIp')}")
+        print(f"loop on   : {state.get('loopHost') or '(this host, via the tunnel)'}"
+              + (f"  pinned {state.get('loopExpectIp')}" if state.get('loopExpectIp') else "")
+              + (f"  tick={state.get('loopTick')}" if state.get('loopTick') else "")
+              + (f" window={state.get('loopWindow')}" if state.get('loopWindow') else ""))
         print(f"dry run   : {state.get('dryRun')}")
         if started:
             print(f"started   : {time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(started))} "
@@ -761,6 +1002,22 @@ def build_parser():
         sp.add_argument("--captcha-timeout", type=int, default=900)
         sp.add_argument("--dry-run", action="store_true")
         sp.add_argument("--dry-seconds", type=float, default=0.0)
+        # --- run the hot loop ON the Korean node instead of tunnelling to it -------
+        sp.add_argument("--loop-host", default=os.getenv("EZLOAN_LOOP_HOST", ""),
+                        help="run the Registrar loop on this ssh host (it must already BE "
+                             "in Korea). Empty = run it here through the tunnel, which is "
+                             "~96ms/post slower. The Naver login always stays here.")
+        sp.add_argument("--loop-expect-ip", default=os.getenv("EZLOAN_LOOP_EXPECT_IP", ""),
+                        help="the loop host's OWN outbound address, pinned. Required with "
+                             "--loop-host: the remote refuses to start without it.")
+        sp.add_argument("--loop-dir", default=os.getenv("EZLOAN_LOOP_DIR", "~/ezloan-loop"),
+                        help="where the loop code is deployed on the loop host")
+        sp.add_argument("--loop-tick", type=float,
+                        default=float(os.getenv("EZLOAN_LOOP_TICK", "0") or 0),
+                        help="FRONTIER_POLL_SECONDS on the loop host (0 = leave default)")
+        sp.add_argument("--loop-window", type=int,
+                        default=int(os.getenv("EZLOAN_LOOP_WINDOW", "0") or 0),
+                        help="PROBE_WINDOW on the loop host (0 = leave default)")
         return sp
 
     common(sub.add_parser("start")).add_argument("--foreground", action="store_true")

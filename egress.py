@@ -36,6 +36,7 @@ class EgressError(RuntimeError):
 
 _lock = threading.RLock()
 _proxy = None
+_direct = False
 _expect_country = "KR"
 _expect_ip = None
 _observed = {"ip": None, "country": None, "at": 0.0}
@@ -49,17 +50,51 @@ _GEO_ENDPOINTS = (
 
 def configure(proxy_url, expect_country="KR", expect_ip=None):
     """Install the egress. Everything else in this module is a no-op until this is called."""
-    global _proxy, _expect_country, _expect_ip
+    global _proxy, _direct, _expect_country, _expect_ip
     with _lock:
         _proxy = (proxy_url or "").strip() or None
+        _direct = False
         _expect_country = (expect_country or "").strip().upper() or None
         _expect_ip = (expect_ip or "").strip() or None
         _observed.update({"ip": None, "country": None, "at": 0.0})
     return _proxy
 
 
+def configure_direct(expect_ip, expect_country="KR"):
+    """The egress IS this host's own address, because this host is already in Korea.
+
+    Only legal when the loop runs ON the Korean node (external-1), which is the whole
+    point of moving it there: no tunnel means no 40ms round trip on the hot path.
+
+    The fail-closed guarantee is preserved, it just moves: instead of "the proxy must be
+    Korean and must not be this host", the rule becomes "this host's own outbound address
+    must BE the pinned Korean address". `expect_ip` is therefore REQUIRED here. Without a
+    pin there is nothing to fail closed against, and an unpinned direct mode on the Tokyo
+    gateway would be exactly the silent non-KR egress this module exists to prevent.
+    """
+    global _proxy, _direct, _expect_country, _expect_ip
+    pin = (expect_ip or "").strip()
+    if not pin:
+        raise EgressError(
+            "direct egress mode requires a pinned expect_ip. Refusing to run without one: "
+            "an unpinned 'direct' egress is indistinguishable from egressing off this host, "
+            "which 403s on ezloan.io and protection-locks the customer's Naver account."
+        )
+    with _lock:
+        _proxy = None
+        _direct = True
+        _expect_country = (expect_country or "").strip().upper() or None
+        _expect_ip = pin
+        _observed.update({"ip": None, "country": None, "at": 0.0})
+    return pin
+
+
+def is_direct():
+    return _direct
+
+
 def is_configured():
-    return bool(_proxy)
+    return bool(_proxy) or _direct
 
 
 def proxy_url():
@@ -76,6 +111,13 @@ def apply(session):
     `trust_env = False` is not cosmetic: without it a stray HTTP_PROXY/NO_PROXY in the
     environment can re-route or un-route the session behind our back.
     """
+    if _direct:
+        # Not a no-op: pinning proxies to {} with trust_env off is what stops a stray
+        # HTTP_PROXY/HTTPS_PROXY in the environment from silently routing the customer's
+        # traffic somewhere that is not this verified Korean host.
+        session.proxies = {}
+        session.trust_env = False
+        return session
     if not _proxy:
         return session
     session.proxies = {"http": _proxy, "https": _proxy}
@@ -85,6 +127,8 @@ def apply(session):
 
 def chrome_proxy_arg():
     """`--proxy-server=` value for Selenium, or None when no egress is configured."""
+    if _direct:
+        return None
     if not _proxy:
         return None
     if "@" in _proxy:
@@ -117,7 +161,7 @@ def _lookup(session, timeout):
 
 def observe(timeout=15, max_age=0.0):
     """Return (ip, country) as seen THROUGH the egress. Raises EgressError if unusable."""
-    if not _proxy:
+    if not _proxy and not _direct:
         raise EgressError("no egress proxy configured")
     with _lock:
         if max_age and _observed["ip"] and (time.time() - _observed["at"]) < max_age:
