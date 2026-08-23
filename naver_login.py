@@ -312,23 +312,53 @@ class NaverLogin:
             element.send_keys(ch)
             time.sleep(0.04)
 
+    # 로그인 제출 버튼 후보. 위에서부터 우선순위 순서다.
+    # 2026-08-23 실측(KR egress, nid.naver.com/nidlogin.login?locale=ko_KR):
+    # 네이버가 로그인 폼을 새 마크업으로 바꿨다. #id / #pw 는 그대로인데 제출 버튼은
+    #   <button type="button" class="btn_done" id="loginBtn_row">   (반응형: 이쪽이 보임)
+    #   <button type="button" class="btn_done" id="loginBtn_column"> (숨김)
+    # 이고, 예전 후보 3개(#log.login, button.btn_login, button[type=submit])는 페이지에
+    # 하나도 존재하지 않는다(실측 n=0, n=0, n=0). 즉 새 페이지에서는 _click_login 이
+    # 무조건 TimeoutException 을 던져 로그인이 시작조차 못 한다.
+    # class 만 보고 'button.btn_done' 을 잡으면 안 된다: DOM 상 첫 .btn_done 은
+    # #passkeyBtn_column(패스키 버튼)이라 엉뚱한 흐름으로 들어간다. 반드시 id 로 찍는다.
+    LOGIN_BUTTON_SELECTORS = (
+        (By.ID, "log.login"),                       # 구 마크업
+        (By.CSS_SELECTOR, "button.btn_login"),      # 구 마크업
+        (By.ID, "loginBtn_row"),                    # 2026-08 마크업(가로/기본 레이아웃)
+        (By.ID, "loginBtn_column"),                 # 2026-08 마크업(세로 레이아웃)
+        (By.CSS_SELECTOR, '#frmNIDLogin button[type="submit"]'),
+        (By.CSS_SELECTOR, 'button[type="submit"]'),
+    )
+
     def _click_login(self):
-        btn = None
-        for how, sel in [
-            (By.ID, "log.login"),
-            (By.CSS_SELECTOR, "button.btn_login"),
-            (By.CSS_SELECTOR, 'button[type="submit"]'),
-        ]:
+        # '보이는' 후보를 우선한다. 반응형 레이아웃 때문에 loginBtn_row / loginBtn_column
+        # 둘 다 DOM 에 있지만 한쪽만 표시되고, 숨은 쪽을 click() 하면 예외가 난다.
+        visible, fallback = None, None
+        for how, sel in self.LOGIN_BUTTON_SELECTORS:
             try:
-                btn = self.d.find_element(how, sel)
-                break
-            except NoSuchElementException:
+                els = self.d.find_elements(how, sel)
+            except WebDriverException:
                 continue
+            for el in els:
+                if fallback is None:
+                    fallback = el
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        visible = el
+                        break
+                except WebDriverException:
+                    continue
+            if visible is not None:
+                break
+        btn = visible or fallback
         if btn is None:
             raise TimeoutException("네이버 로그인 버튼을 찾지 못했습니다.")
         try:
             btn.click()
         except WebDriverException:
+            # 숨은 요소이거나 다른 요소에 가려진 경우. 폼 자체를 submit() 하면 네이버의
+            # 자바스크립트 암호화 핸들러를 건너뛰어 평문이 나가므로 절대 하지 않는다.
             self.d.execute_script("arguments[0].click();", btn)
         self.log('"로그인" 제출')
 
@@ -461,10 +491,16 @@ class NaverLogin:
             pass
 
     def _error_message(self):
-        for how, sel in [(By.CSS_SELECTOR, ".error_message"), (By.ID, "err_common"),
+        # 2026-08-23 실측: 새 로그인 폼은 오류를 .error_message / #err_common 이 아니라
+        # <div class="form_message error" data-case="메시지 == 비밀번호오류메시지"> 로 띄운다
+        # (구 셀렉터는 페이지에 아예 없다). 구 셀렉터도 남겨 두되 새 것을 먼저 본다.
+        for how, sel in [(By.CSS_SELECTOR, ".form_message.error"),
+                         (By.CSS_SELECTOR, ".error_message"), (By.ID, "err_common"),
                          (By.CSS_SELECTOR, ".login_error_wrap .error_message")]:
-            el = self._safe(lambda how=how, sel=sel: self.d.find_element(how, sel))
-            if el is not None and self._safe(lambda el=el: el.is_displayed()):
+            els = self._safe(lambda how=how, sel=sel: self.d.find_elements(how, sel)) or []
+            for el in els:
+                if not self._safe(lambda el=el: el.is_displayed()):
+                    continue
                 txt = (self._safe(lambda el=el: el.text) or "").strip()
                 # 보안문자 안내문은 에러로 취급하지 않음
                 if txt and "자동입력 방지" not in txt and "보안문자" not in txt:

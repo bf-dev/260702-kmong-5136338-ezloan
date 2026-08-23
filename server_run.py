@@ -117,6 +117,11 @@ def log(text):
 
 
 def open_log():
+    """Tee log() into run.log as well as stdout.
+
+    NOT called in the daemon (`_child`): there stdout is already redirected into run.log by
+    the parent, so opening the file again would write every line twice.
+    """
     global _log_fh
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     _log_fh = open(LOG_FILE, "a", encoding="utf-8")
@@ -515,6 +520,62 @@ def cmd_selfcheck(args):
             log("[selfcheck] FAIL: the anonymous detection path did not behave as expected")
             rc = 1
 
+        # The login path is Selenium, and Selenium takes a different code path to the
+        # proxy than requests does. Prove Chrome ALSO leaves from Korea, because that is
+        # the check that stands between us and protection-locking the customer's Naver
+        # account. No credentials are involved and Naver is never visited.
+        if args.browser:
+            from browser import build_driver
+            driver = None
+            try:
+                driver = build_driver(headless=True, log=log,
+                                      proxy=egress.chrome_proxy_arg().split("=", 1)[1])
+                driver.get("https://api.ipify.org/?format=json")
+                seen_ip = json.loads(driver.find_element("tag name", "body").text)["ip"]
+                log(f"[selfcheck] chrome egress={seen_ip} (expected {ip})")
+                if seen_ip != ip:
+                    log("[selfcheck] FAIL: Chrome is not on the Korean route")
+                    rc = 1
+                # Walk the REAL navigation the login takes (ezloan /m/login -> click
+                # "네이버로 로그인" -> Naver OAuth form) and check the selectors
+                # naver_login.py actually drives. NOTHING is typed and no account is
+                # identified, so this cannot touch the customer's Naver account.
+                from naver_login import NaverLogin
+                probe_login = NaverLogin(driver, log=lambda *a: None,
+                                         should_stop=lambda: False)
+                probe_login._open_naver_from_ezloan()
+                html = driver.page_source
+                found = {"#id": bool(driver.find_elements("css selector", "#id")),
+                         "#pw": bool(driver.find_elements("css selector", "#pw"))}
+                submit_hit = None
+                for how, sel in NaverLogin.LOGIN_BUTTON_SELECTORS:
+                    els = driver.find_elements(how, sel)
+                    vis = [e for e in els if e.is_displayed() and e.is_enabled()]
+                    found[f"{how}={sel}"] = f"{len(els)} ({len(vis)} visible)"
+                    if vis and submit_hit is None:
+                        submit_hit = sel
+                blocked = [m for m in ("보호조치", "새로운 기기", "idSafetyRelease", "점검")
+                           if m in html]
+                log(f"[selfcheck] naver oauth form at {driver.current_url[:70]}...: "
+                    f"title={driver.title!r} submit={submit_hit!r} "
+                    f"block_markers={blocked or 'none'}")
+                log(f"[selfcheck]   selectors={found}")
+                if not (found["#id"] and found["#pw"] and submit_hit):
+                    log("[selfcheck] FAIL: the Naver login form selectors are missing")
+                    rc = 1
+            finally:
+                if driver is not None:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+
+        if "tkinter" in sys.modules:
+            log("[selfcheck] FAIL: something on the server path imported tkinter")
+            rc = 1
+        else:
+            log("[selfcheck] no tkinter anywhere in the server run's import graph")
+
         import requests
         r = requests.post(config.WORKS_API, json={
             "customerId": config.CUSTOMER_ID,
@@ -575,6 +636,11 @@ def cmd_start(args):
         if args.dry_seconds:
             argv += ["--dry-seconds", str(args.dry_seconds)]
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    # Only tail what THIS run writes, not whatever the previous run left in the file.
+    try:
+        seen = len(LOG_FILE.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        seen = 0
     out = open(LOG_FILE, "a", encoding="utf-8")
     proc = subprocess.Popen(argv, env=child_env, stdin=subprocess.PIPE,
                             stdout=out, stderr=subprocess.STDOUT,
@@ -590,7 +656,7 @@ def cmd_start(args):
     print(f"started (pid {proc.pid}); log: {LOG_FILE}")
     print("waiting for the egress preflight...")
     deadline = time.time() + 90
-    seen = 0
+    start_offset = seen
     while time.time() < deadline:
         if proc.poll() is not None:
             break
@@ -598,11 +664,12 @@ def cmd_start(args):
             text = LOG_FILE.read_text(encoding="utf-8", errors="replace")
         except Exception:
             text = ""
+        fresh = text[start_offset:]
         for line in text[seen:].splitlines():
             if "[egress]" in line or "[fatal]" in line or "[run]" in line:
                 print("  " + line)
         seen = len(text)
-        if "[egress] VERIFIED" in text or "[fatal]" in text:
+        if "[egress] VERIFIED" in fresh or "[fatal]" in fresh:
             break
         time.sleep(1)
     if not pid_alive(proc.pid):
@@ -691,7 +758,10 @@ def build_parser():
 
     common(sub.add_parser("start")).add_argument("--foreground", action="store_true")
     common(sub.add_parser("_child"))
-    common(sub.add_parser("selfcheck"))
+    common(sub.add_parser("selfcheck")).add_argument(
+        "--browser", action="store_true",
+        help="also launch the headless Chrome the login uses and prove ITS egress is KR "
+             "(downloads Chrome for Testing on first use; never visits Naver)")
     sp = sub.add_parser("stop")
     sp.add_argument("--stop-timeout", type=float, default=60.0)
     sub.add_parser("status")
@@ -721,7 +791,7 @@ def main():
             except Exception:
                 pass
         add_redaction(creds["id"], creds["pw"])
-        open_log()
+        # stdout of this process is run.log (the parent redirected it), so no tee here.
         return _run_child(args, creds)
     return 2
 
