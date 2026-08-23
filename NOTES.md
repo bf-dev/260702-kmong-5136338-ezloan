@@ -1693,16 +1693,40 @@ our run. It is not, and here is why that is certain rather than likely:
   accepted. A competing login would have shown up as a session-lost streak. It did not.
 - **Zero desktop rows since 04:55Z** while our loop has been up for 10 minutes.
 
-Most likely origin: our own tooling. `verify_login_resilient.py` does `import app as app_mod`
-and constructs the App, and there is an Xvfb on `:151` on this host, so any run of that
-verifier emits exactly this pair under the default `config.REMOTE_SOURCE`
-(`ezloan-desktop-v<ver>`); the timestamps sit inside the window the previous session spent
-fixing the Naver login button. `meta.remote` cannot settle it because every upload arrives
-via Cloudflare, so all sources look the same.
+**Origin, identified exactly: it is our own GitHub Actions build.** The workflow's
+"GUI construct self-test" step runs the built exe with `DIAG_AUTO=1`, which goes through
+`main.py` -> `App(root)` -> `remote_log("app_started")` -> `remote_log("auto_update_disabled")`
+-> `root.destroy()` after 1.5s. That is precisely the observed two-event-and-nothing-else
+signature, and the step runs on a `windows-latest` runner with full internet, so it really
+does POST to the Artifacts API under the default `config.REMOTE_SOURCE`
+(`ezloan-desktop-v<ver>`) - indistinguishable from the customer's PC.
 
-**Worth fixing next:** make `verify_login_resilient.py` (and anything else that constructs
-`App`) set `EZLOAN_REMOTE_SOURCE=ezloan-verify` so our own test launches stop masquerading
-as the customer's desktop copy in the artifact stream. This cost a real investigation today.
+`gh run list` matches nine for nine, every `app_started` landing inside a build's window:
+
+```
+build 03:26:28-03:32:18Z   app_started 03:31:59Z
+build 03:29:03-03:34:08Z   app_started 03:33:51Z
+build 03:43:36-03:48:48Z   app_started 03:48:35Z
+build 03:55:06-04:00:19Z   app_started 04:00:03Z
+build 04:32:20-04:37:57Z   app_started 04:37:40Z
+build 04:39:57-04:45:23Z   app_started 04:45:05Z
+build 04:49:30-04:55:02Z   app_started 04:54:45Z
+build 01:01:36-01:03:17Z   app_started 01:02:58Z
+build 01:05:38-01:07:25Z   app_started 01:07:04Z
+```
+
+Then it was confirmed by prediction rather than by correlation: pushing this file's first
+draft at 05:07:06Z started a build, and at **05:12:37Z the pair appeared again** while the
+customer's PC was demonstrably off and our loop was the only thing touching the account.
+
+`meta.remote` cannot help with any of this - every upload arrives via Cloudflare, so CI, the
+customer's PC and this host all look identical in the DB.
+
+**Fixed at the source:** the workflow step now sets `EZLOAN_REMOTE_SOURCE=ezloan-ci-selftest`,
+so CI launches show up under their own name and can never again be mistaken for the
+customer's copy. Anything else that constructs `App` outside the customer's PC must do the
+same. (`verify_login_resilient.py` is NOT such a case: it builds its harness with
+`App.__new__`, so `__init__` never runs and it emits nothing.)
 
 ### Exactly one loop, enforced
 

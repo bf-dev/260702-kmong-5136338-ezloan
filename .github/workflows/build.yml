@@ -112,11 +112,18 @@ jobs:
           --collect-all selenium
           main.py
 
-      - name: GUI construct self-test and Windows screenshot (no network)
+      - name: GUI construct self-test and Windows screenshot
         shell: pwsh
         run: |
           $env:DIAG_AUTO = "1"
           $env:DIAG_SCREENSHOT = "$PWD\windows-verification.png"
+          # 이 셀프테스트는 App 을 실제로 생성하므로 app_started / auto_update_disabled 가
+          # Artifacts API 로 진짜 업로드된다(그래서 'no network' 이 아니다). 기본 source 를
+          # 그대로 두면 'ezloan-desktop-v<ver>' 로 올라가 고객 PC 가 프로그램을 켠 것과
+          # 구분이 되지 않는다. 2026-08-23 에 바로 이것 때문에 '계정에 두 번째 세션이
+          # 붙은 것 아닌가' 를 실제로 조사했다(빌드 9회 = app_started 9회로 확정).
+          # CI 실행은 언제나 자기 이름으로 올라오게 고정한다.
+          $env:EZLOAN_REMOTE_SOURCE = "ezloan-ci-selftest"
           $process = Start-Process -FilePath "dist\이지론배너자동등록.exe" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Windows executable self-test failed: $($process.ExitCode)" }
           if (-not (Test-Path "$PWD\windows-verification.png")) { throw "Windows screenshot was not created" }
