@@ -1267,3 +1267,103 @@ Set `--expect-ip ''` only if you switch nodes and have not re-pinned yet.
 
 Auto-update stays OFF and `version-ezloan-desktop.json` was not touched. Nothing was
 published to the static host.
+
+---
+
+## v2.6.2 (2026-08-23) — the shipped 2.6.1 exe could not log in. Rebuild, no code change.
+
+### What was actually wrong
+
+`ezloan-desktop-2.6.1.exe` on the public path was built by Actions run **32604642191**,
+which is commit **3261c05**. The Naver login-button fix is **0f353c2**, two commits later.
+So the exe we were about to hand the customer still walked the three selectors that no
+longer exist on Naver's form, and it dies on `TimeoutException` the moment a fresh login is
+needed. That moment is now: the ezloan session cookie is 2h Max-Age and had expired.
+
+Proved on the bytes, not from the log (zlib-scan of the PyInstaller archive):
+
+```
+hosted ezloan-desktop-2.6.1.exe    loginBtn_row: 0 hits   log.login: 1 hit
+hosted ezloan-desktop-260823.exe   loginBtn_row: 0 hits   log.login: 1 hit   (same build, renamed)
+new    ezloan-desktop-2.6.2.exe    loginBtn_row: 1 hit    form_message: 1    2.6.2: 1   works/api: 1
+```
+
+That scan is the cheap way to answer "is fix X actually inside the exe we shipped":
+
+```python
+import zlib, re
+data = open(exe, "rb").read()
+for m in re.finditer(rb'\x78[\x01\x9c\xda\x5e]', data):
+    out = zlib.decompressobj().decompress(data[m.start():m.start()+3_000_000])   # in a try
+    if b"loginBtn_row" in out: ...
+```
+
+### Commits that missed the 2.6.1 artifact
+
+`1941ff0` docs only. `7fc701a` server-run path (server_run.py, egress.py, plus
+`egress.apply()` in both `ezloan_bot` session factories, `EZLOAN_*` env knobs in config,
+`config.REMOTE_SOURCE` in bridge) — **all no-ops on the customer's PC**, since every knob
+defaults to the previous Windows behaviour and `EGRESS_PROXY` is empty there. `0f353c2` the
+login fix, **customer-affecting**. `9cbd42e` docs plus one real customer-affecting line:
+`bridge.OwnerCaptchaBridge` now appends a `?cb=<ms>` cache-buster when polling for the
+owner's captcha answer, because Cloudflare edge-caches the initial 404 and the request
+header `Cache-Control: no-cache` alone did not defeat it. So the login fix was not the only
+thing missing: **the captcha bridge would have gone on reading a cached 404** in 2.6.1 too.
+
+There is no commit `affab3c3` in this repo (`git cat-file -t` -> not a valid object). The
+login fix is `0f353c2` alone.
+
+### Guardrails, re-measured live (2026-08-23, KR egress 13.124.160.237 via unicorn@external-1)
+
+`python3 server_run.py selfcheck --browser` walks the real path
+(ezloan.io/m/login -> 네이버로 로그인 -> nid.naver.com/oauth2.0/authorize), types nothing,
+identifies no account:
+
+```
+button.btn_done in DOM order = [('passkeyBtn_column', False), ('loginBtn_column', False),
+                                ('passkeyBtn_row', False),    ('loginBtn_row', True)]
+selectors = {'#id': True, '#pw': True,
+             'id=log.login': '0 (0 visible)', 'css=button.btn_login': '0 (0 visible)',
+             'id=loginBtn_row': '1 (1 visible)', 'id=loginBtn_column': '1 (0 visible)',
+             'css=#frmNIDLogin button[type=submit]': '0 (0 visible)',
+             'css=button[type=submit]': '0 (0 visible)'}
+submit = 'loginBtn_row'   block_markers = none   chrome egress = 13.124.160.237
+```
+
+First `.btn_done` in the DOM is **passkeyBtn_column**, so a bare `button.btn_done` selector
+grabs the PASSKEY button. That is why the chain is id-first and displayed-and-enabled-first,
+and why there is no `form.submit()` fallback (it would bypass Naver's JS credential
+encryption and send the password in the clear). `grep -rn "\.submit()\|btn_done" *.py`
+returns only comments and the selfcheck's own evidence line. The `.btn_done` DOM-order log
+line was added to the selfcheck in this version so the claim stays measured.
+
+### What is proven and what is NOT
+
+Proven: the new chain finds exactly one visible+enabled element (`loginBtn_row`) on the live
+form through a KR egress; it is not the passkey button; the exe contains that code; the exe
+launches on Windows and paints its real UI (CI screenshot, run 32609343965); the loop's
+anonymous detection primitives work live (post 32002 -> True 138ms, 32502 -> False 80ms);
+the Artifacts API upload is intact (`works/api` string in the exe, and a live POST 200
+`matched: true`).
+
+**NOT proven: the credential submit itself.** Clicking `loginBtn_row` and getting a session
+back requires a real Naver id/password, which we do not have. Everything up to and including
+"the right button is found and clickable" is measured; "the login succeeds" is not, and must
+not be claimed until a real credential runs it. The 2026-08-05 restart-skip bug is also
+still open (see the v2.6.1 section).
+
+### Build + hosting
+
+```
+Actions run   32609343965 (commit c3407cb, windows-latest)  ->  PE32+ (GUI) x86-64
+release       gh release download latest --pattern 'ezloan-desktop-2.6.2.exe'
+published     ~/workspace/scripts/works-publish 5136338 ezloan-desktop-2.6.2.exe
+URL           https://works.insu.ng/works/public/5136338/ezloan-desktop-2.6.2.exe
+md5           eb5ad768c6b670f4727586c3788ae69b   33473821 bytes
+              (identical on the built artifact and on a cache-busted download from the
+               public edge, so Cloudflare is not serving a stale object this time)
+```
+
+`AUTO_UPDATE_ENABLED` stays **False**, `version-ezloan-desktop.json` untouched (still points
+at 2.5.4), and `ezloan-desktop-2.6.1.exe` / `ezloan-desktop-260823.exe` were left in place.
+The customer installs 2.6.2 by hand, like every version since the 2.5.3 auto-swap incident.
