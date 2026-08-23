@@ -1580,3 +1580,152 @@ race_watch_kr.py     same, stdlib only, meant to run ON external-1 (~27 ms resol
 
 Evidence kept at `/home/bfdev/workspace/kmong/tmp/ezloan-race/` (tmp is pruned in 14 days;
 the numbers that matter are in this file).
+
+---
+
+## 2026-08-23 04:49-04:56Z — the loop went down, and it now runs on external-8, not external-1
+
+**Read this first if you are picking the run back up.** What is live right now, and how to
+stop it:
+
+```
+loop host   unicorn@external-8   (49.247.139.101, KR)   ~/ezloan-loop/remote_loop.py
+parent      bfdev@main           server_run.py _child, pid in ~/.ezloan-server/5136338/run.pid
+start       cd /home/bfdev/workspace/kmong/projects/260702-kmong-5136338-ezloan
+             EZLOAN_NAVER_ID='...' EZLOAN_NAVER_PW='...' python3 server_run.py start \
+              --ssh-host unicorn@external-8 --expect-ip 49.247.139.101 \
+              --loop-host unicorn@external-8 --loop-expect-ip 49.247.139.101 \
+              --loop-tick 0.08 --loop-window 1
+STOP        python3 /home/bfdev/workspace/kmong/projects/260702-kmong-5136338-ezloan/server_run.py stop
+status      python3 server_run.py status
+```
+
+Credentials are in the customer's own Kmong message of 2026-08-23 01:54 (`search_conversation`
+for `비번`). They are never written to disk; the leading space in front of the env
+assignment keeps them out of `~/.bash_history`.
+
+### The outage
+
+```
+04:49:39.293Z  [run_stopped] 폴링 루프 중지            <- previous session stopped the loop
+04:49:40Z      remote loop exited rc=0 after 562s (stop requested)
+               ... nothing running, customer has zero coverage ...
+04:54:18Z      restart attempt on external-1: [egress] opening KR tunnel
+04:54:48Z      FATAL  ssh tunnel to unicorn@external-1 did not open within 30s
+04:56:23Z      restart on external-8: tunnel up in 2s
+04:56:27Z      [egress] VERIFIED egress=49.247.139.101 (KR) this-host=46.250.255.29 ezloan.io=200
+04:56:28Z      [login] reusing the saved ezloan session (11 cookies), no Naver login needed
+04:56:33Z      [kr] 자동 등록 시작됨                    <- coverage restored
+```
+
+**Total downtime 414 seconds (6m54s).** ~150s of that was the failed external-1 attempt.
+
+The stored `session.json` was still valid, so the restart cost no Naver login, no Chrome,
+and no captcha risk. That is the single most useful property of the session store: a
+restart inside the cookie lifetime is a 15-second operation.
+
+### Why external-1 is no longer the loop host
+
+external-1 answered ssh and served ezloan normally at 04:51Z, and by 04:54Z it was **fully
+offline on Tailscale** (`tailscale status`: `offline`; ICMP to 100.106.186.29 100% loss;
+ssh :22 timeout). Still offline at 05:05Z. Same host, same symptom class as the 04:09Z blip
+that the egress guard turned into a 316s outage earlier today.
+
+Do not wait for it. The measurement that made external-1 "the" host was taken **through the
+tunnel from Tokyo**, and that number is a property of the tunnel, not of the node. Measured
+again today from the nodes themselves, 12 warm keep-alive `GET /rq/{miss}` on the live site:
+
+```
+external-1   (offline, could not be measured)
+external-2   p50 44.3 ms   min 43.2 ms   115.68.232.141
+external-8   p50 44.2 ms   min 42.9 ms    49.247.139.101   <- chosen
+```
+
+Both KR nodes are at the same 44 ms as external-1's own 52.2 ms direct figure, i.e. **there
+is no latency reason to prefer external-1**, and external-8 has a direct (not relayed)
+Tailscale path. The old "184.9 ms external-8" line in the latency table above is the
+Tokyo-to-external-8 tunnel cost and must not be read as this node's cost to ezloan.
+
+external-2 is the equivalent standby if external-8 ever goes the same way.
+
+### The six missing 배너잔여 were not missing (do not re-investigate this)
+
+Symptom that looked alarming: 배너잔여 was 483 when a run was stopped, and the next run's
+first cycle read `배너잔여=477 등록=0`, i.e. six credits gone with zero registrations on the
+counter. It is an artifact of the per-run counter, nothing else. From the gateway DB
+(`IngestedLog`, customerKey 5136338), the credit ledger reconciles exactly 1:1:
+
+```
+04:06:33.200Z  [registered] post=32008   -> 배너잔여 483 -> 482
+04:16:39.307Z  [registered] post=32009   -> 482 -> 481
+04:17:24.620Z  [registered] post=32010   -> 481 -> 480
+04:18:22.528Z  [registered] post=32011   -> 480 -> 479
+04:22:44.954Z  [registered] post=32012   -> 479 -> 478
+04:38:03.153Z  [registered] post=32013   -> 478 -> 477
+04:40:21.018Z  [run_started]                      <- external-1 cutover; 등록 counter RESETS to 0
+```
+
+Six registrations, six credits, all of them ours and all of them logged. `등록=N` is a
+**per-run** counter that starts at 0 on every `run_started`; `배너잔여` is the account-side
+balance that does not. Reading the two side by side across a restart boundary is what makes
+it look like a leak. Two supporting facts, both worth keeping:
+
+- **The pre-open retry path spends nothing.** `no_permission` waiting re-polls
+  `rq_addbanner_check`, a 47-byte READ. Verified in the ledger: the three `no_permission`
+  events (32005/32006/32007, 03:07-03:53Z) all carry `마지막배너잔여=483` and the balance did
+  not move across any of them.
+- **ezloan did not expire anything.** Every one of the 6 decrements lands on the cycle
+  immediately after a `[registered]`, never between them.
+
+### There was no second session (checked, not assumed)
+
+`ezloan-desktop-v2.6.2` posted `[app_started]` + `[auto_update_disabled]` pairs at 03:31,
+03:33, 03:48, 04:00, 04:37, 04:45 and 04:54Z, which reads like the customer's PC copy racing
+our run. It is not, and here is why that is certain rather than likely:
+
+- **Those two events are all there ever is.** `app_started` fires in `app.py` at tkinter
+  window construction (`App.__init__`), *before* any login and before the Registrar exists.
+  There is not one desktop-source `[run_started]`, `[cycle]`, or `[registered]` row for this
+  customer, today or ever. No second Registrar loop existed.
+- **Our ezloan session was never invalidated.** ezloan is single-session: a second login
+  kills the first cookie. `세션없음연속=0` on all 151 cycles spanning 04:30-05:05Z, straddling
+  the 04:37 / 04:45 / 04:54 events, and at 04:56:28Z the saved cookies from 04:38 were still
+  accepted. A competing login would have shown up as a session-lost streak. It did not.
+- **Zero desktop rows since 04:55Z** while our loop has been up for 10 minutes.
+
+Most likely origin: our own tooling. `verify_login_resilient.py` does `import app as app_mod`
+and constructs the App, and there is an Xvfb on `:151` on this host, so any run of that
+verifier emits exactly this pair under the default `config.REMOTE_SOURCE`
+(`ezloan-desktop-v<ver>`); the timestamps sit inside the window the previous session spent
+fixing the Naver login button. `meta.remote` cannot settle it because every upload arrives
+via Cloudflare, so all sources look the same.
+
+**Worth fixing next:** make `verify_login_resilient.py` (and anything else that constructs
+`App`) set `EZLOAN_REMOTE_SOURCE=ezloan-verify` so our own test launches stop masquerading
+as the customer's desktop copy in the artifact stream. This cost a real investigation today.
+
+### Exactly one loop, enforced
+
+```
+external-8   pgrep -af 'python3 -u remote_[l]oop.py'  ->  1  (pid 1532521)
+external-2   ->  0
+external-1   unreachable, but its loop reported its own clean exit rc=0 at 04:49:40Z
+             BEFORE the host dropped, so there is no orphan to reason about
+main         one server_run.py _child (pid 232995) + its one ssh channel
+```
+
+### State after the restart
+
+```
+04:56:41Z  [baseline] 직전 seen 최대=32013, 최대번호=32014, frontier=32015, 따라잡기 대상 1건(32014)
+04:56:41Z  [registered] post=32014 rank=8  위에=옥자대부(544),헤븐금융대부(330),전국한마음대부중개(310),
+                        24시월변대부중개(607),미라클월변대부중개(408),서일대부(545),테이아이대부중개(597)
+05:00:34Z  [registered] post=32015 rank=미확인
+05:05:31Z  [cycle] #497 목록=20 새글=0 누적확인=33 등록=2 세션없음연속=0 frontier=32016 배너잔여=475
+```
+
+32014 at rank 8 is expected and is not a regression: it is the restart catch-up path
+registering a post that opened during the 414s gap, so the whole field was already on it.
+32015 is the first post this run saw from the frontier.
+
+`배너잔여` is **475** as of 05:05Z (477 at the stop, minus 32014 and 32015).
