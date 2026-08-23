@@ -55,7 +55,7 @@ def probe_session(proxy: str = "socks5h://127.0.0.1:1085") -> requests.Session:
     return s
 
 
-def banner_list(html: str):
+def banner_order(html: str):
     """[(advertiser_id, name, css_class), ...] in true DOM/exposure order."""
     m = _LIST_RE.search(html)
     body = m.group(1) if m else html
@@ -64,6 +64,10 @@ def banner_list(html: str):
         name = title.split("-", 1)[0].strip()
         out.append((aid, name, cls.strip()))
     return out
+
+
+# 예전 이름. rank_audit.py 가 쓰던 이름이라 별칭으로 남긴다.
+banner_list = banner_order
 
 
 def page_exists(html: str, status: int) -> bool:
@@ -83,4 +87,4 @@ def fetch_post(s: requests.Session, pid: int, timeout: float = 8.0):
     html = r.text or ""
     if not page_exists(html, r.status_code):
         return False, [], dt, r.status_code
-    return True, banner_list(html), dt, r.status_code
+    return True, banner_order(html), dt, r.status_code
