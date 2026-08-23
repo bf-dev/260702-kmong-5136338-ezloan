@@ -1753,3 +1753,156 @@ registering a post that opened during the 414s gap, so the whole field was alrea
 32015 is the first post this run saw from the frontier.
 
 `배너잔여` is **475** as of 05:05Z (477 at the stop, minus 32014 and 32015).
+
+---
+
+## 2026-08-23 05:35Z — the competitor-timing sampler is back up, on external-2
+
+The previous session left "a high-resolution sampler running on external-1" to grow the
+competitor sample. external-1 then went fully offline on Tailscale (see the section above)
+and took the sampler with it, so **the key number stayed at n=1 and nobody noticed.**
+This section is how it runs now and how to look at it.
+
+### Where it runs and how to stop it
+
+```
+host      unicorn@external-2      115.68.232.141 (KR, direct egress, no proxy)
+dir       ~/ezloan-sampler/
+code      race_sampler.py         (repo: projects/260702-kmong-5136338-ezloan/race_sampler.py)
+runner    race_sampler_run.sh     flock -n, so it is idempotent
+log       ~/ezloan-sampler/sampler.log        (rotated by the runner at 32MB)
+data      ~/ezloan-sampler/race_summary.jsonl one compact row per post  <- the dataset
+          ~/ezloan-sampler/race_detail.jsonl  full prelive + burst trace (capped 64MB)
+          ~/ezloan-sampler/report.txt         the rendered distribution, rewritten per post
+          ~/ezloan-sampler/state.json         next post id, so a restart resumes
+
+START     ssh unicorn@external-2 'setsid nohup ~/ezloan-sampler/race_sampler_run.sh \
+                                  >/dev/null 2>&1 </dev/null &'
+          (or just wait <=2 min: the cron watchdog starts it)
+STOP      ssh unicorn@external-2 'crontab -r; pkill -f race_sampler'
+          BOTH halves are needed. `pkill` alone and the watchdog brings it straight back.
+REPORT    ssh unicorn@external-2 'python3 ~/ezloan-sampler/race_sampler.py --report-only'
+```
+
+Do **not** `pkill -f race_sampler.py` from inside a one-line `ssh 'a; b; c'` command: the
+remote `bash -c` carries that string in its own argv, pkill matches it, and ssh dies with
+255 before the rest of the line runs. Use `pkill -f race_sampler` from a plain shell, or
+kill the pid.
+
+Survives a host reboot and a dropped session:
+
+```
+crontab (unicorn@external-2)
+@reboot sleep 45; $HOME/ezloan-sampler/race_sampler_run.sh >/dev/null 2>&1
+*/2 * * * * $HOME/ezloan-sampler/race_sampler_run.sh >/dev/null 2>&1
+```
+
+`flock -n` inside the runner means the every-2-minutes line is a no-op while a sampler is
+already up, and a real restart within 2 minutes if the process ever dies. Nothing about it
+depends on an ssh session staying open, and nothing about it depends on external-1.
+
+### Why external-2 and not external-8
+
+external-8 is the live registration loop's host. The sampler's burst phase is ~35 req/s of
+35KB pages for 3 seconds; putting that on the same box as the loop would have it competing
+for the loop's CPU and sockets at exactly the moment the loop is trying to register.
+external-2 is the measured equal on the wire (p50 44.3ms vs external-8's 44.2ms to ezloan,
+both KR) and was idle (load 0.00). external-1 is out of the picture permanently.
+
+### What it records, per post
+
+```
+t0                 the moment /rq/{id} first renders its banner <ul>  (= registration opens)
+t_rival            when 옥자대부 (544) appears, seconds after t0, ms resolution
+t_ours             when we (585) appear, seconds after t0
+arrivals[]         every advertiser with its arrival time and slot-at-arrival
+final_order        the resulting slot order, and slot_ours / slot_rival
+publish_bracket_s  gap between the last "not open yet" observation and t0
+armed_lead_s       how long the post id existed before the banner list rendered
+```
+
+`publish_bracket_s` is the point of the whole design: it is the measurement error on every
+arrival time in that row, so the distribution is reported **with** its error rather than as
+a bare number. The old n=1 sample (post 32005, 140ms) carries a 250ms bracket, i.e. it was
+never precise enough to claim 140ms as a fact. Do not quote it without the bracket.
+
+### Request pacing (it shares an origin with the customer's live loop)
+
+```
+IDLE   id not allocated, 353-byte miss     2 threads x 0.30s      ~6.7 req/s   (dominates)
+ARMED  id allocated, banner list absent    3 threads x 0.05s      ~60 req/s    (bounded 120s)
+BURST  t0 .. +3s                           3 threads back-to-back ~35 req/s
+MID    +3s .. +30s                         1 x 0.5s               2 req/s
+TAIL   +30s .. +180s                       1 x 3.0s               0.3 req/s
+```
+
+IDLE is what runs almost all the time (posts arrive every ~15-45 min) and it is 353-byte
+misses, the same request shape the loop already fires at 12.5 req/s. ARMED and BURST are
+short bounded windows around a publish. Every one of those numbers is a CLI flag
+(`--idle-threads`, `--armed-period`, `--burst-seconds`, ...) so the next session can
+throttle without editing code. If ezloan ever starts rate-limiting, **cut the sampler
+first**: losing samples is cheap, getting this account throttled is not.
+
+The ARMED escalation is the trick that keeps IDLE cheap. NOTES section "3. We were also
+throwing posts away outright" established that ezloan allocates the post id ~18s before
+registration opens; the sampler only spends the expensive poll rate inside that window.
+`armed_lead_s` in each row tells you whether that window is visible to an anonymous client
+too. If it turns out to be null on every post, the id goes straight from 353 bytes to the
+full page and IDLE alone sets the bracket at ~150ms, in which case raise `--idle-threads`.
+
+### Read-only, verified
+
+Anonymous GETs only. No login, no `rq_addbanner`, no `rq_addbanner_check`, no second
+session, no 배너잔여 spent. `race_sampler.py` contains no write path at all: grep it for
+`addbanner` and you get nothing. The live loop on external-8 remains the only thing that
+writes, and it was confirmed still running (pid 1532521) after the sampler came up.
+
+### It uploads to the Artifacts API after every post
+
+`source: ezloan-race-sampler`, `customerId 5136338`. Each upload is the full rendered
+distribution as `text` plus the whole `race_summary.jsonl` gzipped as a file, so the
+dataset survives the process, the host, and the session that started it. Confirmed
+`matched=true` (id 96acbffb-bb90-4b80-b773-c78267d29931, 05:36:28Z).
+
+**Gotcha that cost 20 minutes:** works.insu.ng is behind Cloudflare and 403s the default
+`Python-urllib/3.x` User-Agent. The reporter must send a browser UA. The first upload
+failed silently because the original catch-all swallowed the reason; it now logs the HTTP
+code and body head and retries 3x. Any future stdlib reporter on these boxes needs the
+same UA.
+
+### Independent of the timing samples: we are now taking slot 1
+
+Anonymous slot audit of the posts around the external-8 cutover, run from external-2:
+
+```
+32008  1 옥자대부      2 더원대부중개(585)
+32009  1 옥자대부      2 더원대부중개
+32011  1 옥자대부      2 더원대부중개
+32012  1 옥자대부      2 더원대부중개
+32013  1 옥자대부      2 더원대부중개
+32014  1 옥자대부      ... 8 더원대부중개      <- restart catch-up post, expected
+32015  1 더원대부중개  2 옥자대부              <- first post of the external-8 run
+32016  1 더원대부중개  2 옥자대부
+32017  1 더원대부중개  2 옥자대부
+```
+
+**Three consecutive head-to-head wins over 옥자대부** (32015/32016/32017), against a prior
+history of 2 wins in ~1000 posts. That is the loop move to external-8 plus tick 0.08 plus
+the pre-open wait, and it is direct evidence that 140ms is beatable. It is NOT a timing
+distribution: it says we won, not by how much or how reliably. That is exactly what the
+sampler is for, and n is still small, so do not promise the customer 1등 off these three.
+
+Note also `32010` renders as a permanent 353-byte miss: ezloan burns post ids that never
+publish. The sampler's lookahead (`--lookahead-seconds 60`, `--lookahead-gap 2`) detects
+that and advances the frontier instead of waiting forever.
+
+### Tools
+
+```
+race_sampler.py       the sampler (stdlib only, so nothing to install on the box)
+race_sampler_run.sh   flock runner used by cron and by hand
+  --report-only       print the distribution from the existing summary and exit
+race_watch_kr.py      SUPERSEDED by race_sampler.py. It has no daemon mode, no restart
+                      survival, and no Artifacts upload, which is exactly why the n=1
+                      number died with external-1. Do not restart it.
+```
