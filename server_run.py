@@ -285,6 +285,33 @@ def _run_child(args, creds):
                     dryRun=bool(args.dry_run), startedAt=time.time(), pid=os.getpid())
 
         def on_egress_violation(reason):
+            # When the loop runs HERE, this tunnel is the customer's only route and a
+            # violation must stop everything. When the loop runs in Korea it is not in
+            # the hot path at all: it exists only so the Chrome login has a KR route.
+            # Killing a healthy remote loop because a login-only tunnel blipped is how we
+            # lost 5 minutes at 04:09 today, so in that mode this is a repair, not a kill.
+            if args.loop_host:
+                log(f"[egress] the login tunnel is unusable ({reason}). The KR loop is "
+                    f"unaffected (it has its own guard); reopening the tunnel.")
+                remote("login_tunnel_degraded",
+                       f"로그인용 터널 이상({reason}). KR 루프는 그대로 동작하며, "
+                       f"터널만 다시 엽니다.", force=True)
+                try:
+                    tunnel.stop()
+                    proxy = tunnel.start()
+                    egress.configure(proxy, expect_country=args.expect_country,
+                                     expect_ip=args.expect_ip or None)
+                    egress.require()
+                    log("[egress] login tunnel reopened and re-verified")
+                except Exception as e:
+                    log(f"[egress] could not reopen the login tunnel: {redact(str(e))}. "
+                        f"A re-login will be refused until it comes back, which is the "
+                        f"safe failure: a Naver login from a non-KR address locks the "
+                        f"customer's account.")
+                # Re-arm; start_guard's thread returns after any violation.
+                egress.start_guard(on_egress_violation, interval=args.guard_interval,
+                                   stop_event=stop_event)
+                return
             fatal["reason"] = f"egress guard: {reason}"
             log(f"[egress] FATAL {reason} -- stopping the run rather than egressing "
                 f"from this host")

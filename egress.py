@@ -205,11 +205,17 @@ def require(timeout=20, check_url=None):
       5. that address is NOT this host's own address
       6. the target site actually answers through it (optional but on by default)
     """
-    if not _proxy:
+    if not _proxy and not _direct:
         raise EgressError(
             "no Korean egress configured. This run is refused rather than falling back to "
             "this host's own IP: ezloan.io 403s a non-KR address and a Naver login from one "
             "protection-locks the customer's account."
+        )
+    if _direct and not _expect_ip:
+        # configure_direct() already refuses this, so reaching it means someone poked the
+        # module state by hand. Refuse again rather than trust it.
+        raise EgressError(
+            "direct egress mode is active with no pinned address. Refusing to start."
         )
     chrome_proxy_arg()  # raises if the URL carries credentials
 
@@ -228,15 +234,19 @@ def require(timeout=20, check_url=None):
             f"could not confirm the country of egress address {ip} and no "
             f"EZLOAN_EGRESS_EXPECT_IP is pinned. Refusing to start."
         )
-    try:
-        own = direct_ip(timeout=10)
-    except Exception:
-        own = None
-    if own and own == ip:
-        raise EgressError(
-            f"the proxy egress ({ip}) is identical to this host's own address; the traffic "
-            f"is not actually going through the Korean route. Refusing to start."
-        )
+    if not _direct:
+        # Proxy mode: the egress must NOT be this host, or the tunnel is not really in
+        # the path. In direct mode the two are the same address by definition, and the
+        # pin check above is what proves that address is the Korean one.
+        try:
+            own = direct_ip(timeout=10)
+        except Exception:
+            own = None
+        if own and own == ip:
+            raise EgressError(
+                f"the proxy egress ({ip}) is identical to this host's own address; the "
+                f"traffic is not actually going through the Korean route. Refusing to start."
+            )
     if check_url:
         s = requests.Session()
         apply(s)
