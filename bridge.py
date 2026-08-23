@@ -42,7 +42,10 @@ def remote_log(event, detail="", snapshot="", force=False):
                 text = f"{text}\n{snapshot[:4000]}"
             payload = {
                 "customerId": config.CUSTOMER_ID,
-                "source": f"ezloan-desktop-v{config.APP_VERSION}",
+                # config.REMOTE_SOURCE defaults to ezloan-desktop-v<ver>; the server-side
+                # headless run overrides it so its rows are told apart from the ones the
+                # customer's own PC uploads.
+                "source": config.REMOTE_SOURCE,
                 "text": text[:6000],
                 "event": event,
                 "detail": detail,

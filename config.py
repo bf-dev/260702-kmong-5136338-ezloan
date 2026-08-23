@@ -174,7 +174,26 @@ AUTO_UPDATE_ENABLED = False
 # 프로그램이 자체 관리하는 크롬(Chrome for Testing) / 프로필 위치
 _HOME = os.path.expanduser("~")
 CHROME_CACHE_DIR = os.path.join(_HOME, ".ezloan_bot", "chrome")
-CHROME_PROFILE_DIR = os.path.join(_HOME, ".ezloan_bot", "profile")
-APP_DIR = os.path.join(os.getenv("APPDATA", _HOME), "EzloanBot")
+CHROME_PROFILE_DIR = os.getenv("EZLOAN_CHROME_PROFILE_DIR") or os.path.join(
+    _HOME, ".ezloan_bot", "profile")
+APP_DIR = os.getenv("EZLOAN_APP_DIR") or os.path.join(os.getenv("APPDATA", _HOME), "EzloanBot")
 # 재시작 후 로그인 세션 복구용: 캡처한 이지론/네이버 쿠키를 여기에 저장한다.
 SESSION_FILE = os.path.join(APP_DIR, "session.json")
+
+# --- server-side headless run (the customer's Windows build is unaffected) ----
+# Everything below is read from the environment and defaults to exactly the behaviour the
+# Windows build has always had. It only takes effect when server_run.py sets it.
+#
+# EZLOAN_EGRESS_PROXY: credential-free SOCKS5 URL of a KOREAN egress, e.g.
+#   socks5h://127.0.0.1:1085 (a dedicated `ssh -N -D` tunnel to a KR node). When empty the
+#   program connects directly, which is correct on the customer's own PC in Korea and is
+#   REFUSED by server_run.py on our server (egress.py explains why fail-open is dangerous:
+#   ezloan.io 403s a non-KR address, and a Naver login from one protection-locks the
+#   customer's real Naver account).
+EGRESS_PROXY = os.getenv("EZLOAN_EGRESS_PROXY", "").strip()
+EGRESS_COUNTRY = os.getenv("EZLOAN_EGRESS_COUNTRY", "KR").strip().upper()
+EGRESS_EXPECT_IP = os.getenv("EZLOAN_EGRESS_EXPECT_IP", "").strip()
+# Artifacts API `source`. The server-side run overrides it so its rows are distinguishable
+# from the rows the customer's own PC uploads.
+REMOTE_SOURCE = (os.getenv("EZLOAN_REMOTE_SOURCE", "").strip()
+                 or f"ezloan-desktop-v{APP_VERSION}")

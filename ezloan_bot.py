@@ -21,6 +21,7 @@ from pathlib import Path
 import requests
 
 import config
+import egress
 
 # 한국 표준시(KST)는 UTC+9 고정(서머타임 없음). 고객 PC 의 로컬 시간대 설정이나
 # PyInstaller onefile 에 타임존 DB 가 안 실리는 문제와 무관하게 항상 KST 를 계산하려고
@@ -138,6 +139,12 @@ def _sync_csrf_header(s):
 
 def session_from_cookies(cookies):
     s = requests.Session()
+    # Server-side runs pin every session to a Korean egress. No-op (and no import cost at
+    # runtime) on the customer's PC, where config.EGRESS_PROXY is empty. Doing it inside the
+    # two session factories, rather than at each call site, is deliberate: every request the
+    # bot makes is born from one of these two functions, so there is no path left that can
+    # quietly leave from the host's own IP.
+    egress.apply(s)
     csrf = None
     for c in cookies:
         try:
@@ -324,6 +331,7 @@ def new_probe_session():
       창3 쿠키차단: scan p50  53.0ms
     """
     s = requests.Session()
+    egress.apply(s)   # see session_from_cookies(); the probe session takes the same route
     s.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
