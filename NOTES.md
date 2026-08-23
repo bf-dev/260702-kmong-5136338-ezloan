@@ -1079,3 +1079,191 @@ carries the v2.6.0 detection work (read-gated hot path) with it.
 
 Artifacts API untouched and re-verified end to end: a POST in bridge.py's exact payload shape
 with `source: ezloan-desktop-v2.6.1` returned `200 {"success":true,"matched":true}`.
+
+---
+
+## 2026-08-23 — server-side headless run, PREPARED AND NOT STARTED (customer 5136338)
+
+The customer's PC has been dead since 2026-08-22 04:56 UTC and they are out for the day, so
+they asked us to run the bot for them. This section is the runbook. **Nothing is running.
+No login has been performed. No banner has been registered. 배너잔여 was 491 at their last
+report and none of it has been spent.**
+
+### What was built
+
+`server_run.py` is the only new entry point. It reuses `ezloan_bot` / `naver_login` /
+`browser` / `session_store` / `bridge` unchanged and never imports `app.py` or
+`captcha_dialog.py`, the two tkinter modules. The Registrar loop, the frontier scan, the
+existence gate, the outage backoff, the restart catch-up: all the same code the customer's
+exe runs. `egress.py` is the new fail-closed Korean egress.
+
+Windows build is untouched in behaviour: every new setting is an env var that defaults to
+exactly what the exe did before, and CI (GitHub Actions run 32608207289) is green on it.
+
+### THE COMMAND (run this once the customer sends the login)
+
+```bash
+cd /home/bfdev/workspace/kmong/projects/260702-kmong-5136338-ezloan
+ EZLOAN_NAVER_ID='<naver-id>' EZLOAN_NAVER_PW='<naver-password>' \
+   python3 server_run.py start
+```
+
+Note the LEADING SPACE before `EZLOAN_NAVER_ID`: with the default `HISTCONTROL=ignorespace`
+that keeps the password out of `~/.bash_history`. The command prints the egress preflight
+and then returns; the run is a detached daemon.
+
+```bash
+python3 server_run.py status     # running? which egress? since when?
+tail -f ~/.ezloan-server/5136338/run.log
+python3 server_run.py stop       # <- HAND CONTROL BACK. ONE COMMAND.
+```
+
+**Stop it before telling the customer to restart their own copy.** The ezloan account is
+single-session; two copies racing the same session is a known way to break it. `stop` sets
+a STOP file, SIGTERMs the daemon, waits for it to exit, kills the ssh tunnel, clears the
+pid file, and prints a banner. It also posts `server_run_stopped` to the Artifacts API, so
+the customer agent sees in the next turn that the session is free.
+
+### Credentials
+
+Read from the environment by the short-lived parent process, handed to the daemon over a
+pipe, and the daemon is spawned with those two variables REMOVED from its environment, so
+`ps eww` / `/proc/<pid>/environ` on the long-lived process shows nothing. Held in memory
+only, redacted (`***`) out of every log line and every Artifacts upload, never written to
+disk. What IS written to disk is `~/.ezloan-server/5136338/session.json` (mode 0600), the
+ezloan session cookies, which is what lets a restart resume without a fresh Naver login.
+That directory is outside the git repo on purpose.
+
+### Korean egress: required, pinned, and fail closed
+
+Two independent reasons this cannot fall back to the host IP. ezloan.io 403s a non-KR
+address (loud). And **a Naver login attempted from a non-KR IP protection-locks the
+customer's real Naver account** (silent, and expensive for them to unwind). So "no proxy"
+and "proxy is down" both mean STOP.
+
+Route: a dedicated `ssh -N -D 127.0.0.1:1085 unicorn@external-1` tunnel that the run owns
+and kills itself. external-1 is our own idle AWS Seoul box and measured fastest to ezloan
+from this host (warm keep-alive p50 **77.5ms**, vs 90.0 external-6, 184.9 external-8,
+188.4 external-2; all four answered 200 on ezloan.io). Deliberately NOT the shared PM2
+`kr-socks-navercafe` tunnel on :1080, which is the Kmong egress path.
+
+The tunnel is credential-free on purpose: **Chrome cannot authenticate to a SOCKS5 proxy**,
+so a `user:pass@` URL would work for `requests` and silently NOT work for the Selenium
+login, i.e. the exact fail-open that locks the account. `egress.chrome_proxy_arg()` raises
+rather than allow it.
+
+Checks before the loop starts (any failure = refuse to start, verified live):
+
+| check | behaviour |
+|---|---|
+| no proxy configured | REFUSED |
+| proxy URL carries credentials | REFUSED (Chrome could not use it) |
+| tunnel down / port closed | REFUSED |
+| egress IP != pinned `EZLOAN_EGRESS_EXPECT_IP` | REFUSED |
+| egress country != KR | REFUSED |
+| egress IP == this host's own IP | REFUSED |
+| ezloan.io not 200 through the tunnel | REFUSED |
+| Chrome's own egress != the verified IP | login ABORTED before a credential is typed |
+| egress moves mid-run (guard thread, 60s) | run STOPS |
+
+Both session factories in `ezloan_bot` (`session_from_cookies`, `new_probe_session`) pin
+themselves to the egress with `trust_env = False`, so there is no request path left that
+can leave from this host. Proven: with the tunnel down, a probe session raises
+`ConnectionError` instead of reaching ezloan directly.
+
+### Naver moved the login button (found while preparing this, fixed)
+
+`_click_login` walked `#log.login` -> `button.btn_login` -> `button[type="submit"]`.
+Live on the REAL navigation path (ezloan.io/m/login -> click 네이버로 로그인 ->
+nid.naver.com/oauth2.0/authorize), 2026-08-23 from the KR egress:
+
+```
+#id                     present        #log.login              0 elements
+#pw                     present        button.btn_login        0 elements
+#loginBtn_row           1 (1 visible)  button[type="submit"]   0 elements
+#loginBtn_column        1 (0 visible)
+```
+
+All three old candidates are gone, so `_click_login` raised `TimeoutException` on every
+attempt and the login could never start. **This affects the customer's Windows build too.**
+Fixed via `NaverLogin.LOGIN_BUTTON_SELECTORS`, which keeps the legacy ids first, adds
+`#loginBtn_row` / `#loginBtn_column`, and picks the first DISPLAYED+ENABLED match (the two
+are a responsive pair, only one is visible, and clicking the hidden one throws).
+
+Two traps in there, do not "simplify" them:
+- **Never match bare `button.btn_done`.** The first `.btn_done` in the DOM is the PASSKEY
+  button, not login.
+- **Never fall back to `form.submit()`.** That skips Naver's JS handler that encrypts the
+  credentials, so the password would go out in the clear.
+
+`_error_message()` was stale the same way: failures now render in
+`div.form_message.error` (`data-case="메시지 == 비밀번호오류메시지"`); `.error_message` and
+`#err_common` no longer exist. Old selectors kept, new one checked first.
+
+`bridge.OwnerCaptchaBridge._poll_answer` now cache-busts its poll URL. The answer file only
+appears after the captcha does, so the first poll 404s, Cloudflare edges that 404, and the
+answer could sit there unseen. Verified the channel serves 200 with a cache-buster.
+
+### If Naver shows a captcha
+
+There is no GUI, so the captcha goes to the OWNER, not the customer: the image is uploaded
+to the Artifacts API (source `ezloan-captcha-v2.6.1`) and the run polls
+`https://works.insu.ng/works/public/5136338/captcha_answer.txt` every 3s for 15 minutes.
+Answer it with:
+
+```bash
+printf '%s\n' '<token>|<answer>' > /tmp/ans.txt
+install -m 0644 /tmp/ans.txt \
+  /home/bfdev/neoworks/apps/gateway/artifacts/public/5136338/captcha_answer.txt
+# delete it again once consumed, or the next captcha reads a stale answer
+```
+
+The token is printed in the upload text. A bare answer with no `token|` prefix is also
+accepted.
+
+### What is proven, and what is not
+
+Proven live (2026-08-23, `python3 server_run.py selfcheck --browser`, all PASS):
+- egress `13.124.160.237` (KR, ipinfo) vs this host `46.250.255.29`; ezloan.io 200 through it
+- anonymous detection on real ids: post 32002 -> `True` (143ms), post 32502 -> `False` (82ms)
+- the real hot path ticking: 165 `Registrar._scan_frontier` ticks in 25.0s (0.151s period,
+  matching `FRONTIER_POLL_SECONDS=0.15`), scan p50 ~142ms, `live=[32002]`, zero writes
+- headless Chrome on this Linux host (Chrome for Testing 152.0.7977.54) egressing from the
+  same KR address, loading ezloan /m/login and reaching the Naver OAuth form
+- `_click_login` clicking `loginBtn_row` on the live form (no credentials typed)
+- Artifacts API: `200 {"success":true,"matched":true}`, rows stored under source
+  `ezloan-server-v2.6.1`, confirmed in the gateway DB (`IngestedLog`)
+- clean stop: SIGTERM -> loop exits mid-tick -> registrar closed -> tunnel killed -> pid
+  file removed -> `server_run_stopped` uploaded
+- all 9 CI repro gates + all 4 verify gates still pass; Actions build green
+
+NOT proven, and cannot be until a real login exists:
+- the Naver credential submit itself, and whatever Naver does after it (captcha, new-device
+  verification, 2단계 인증). A device-registration prompt is the most likely blocker and
+  the app has no handler for it.
+- that ezloan issues an `ezloan_sess` cookie to this session
+- an actual `rq_addbanner` registration (deliberately never attempted)
+- `_captcha_present` / `_captcha_image_bytes` selectors against the current Naver markup
+  (they only exist once a captcha is served, and the rest of that form is demonstrably
+  newer markup than the app expects, so treat a captcha as a likely second bug)
+
+`repro_login_timeout.py` hangs for ~20 minutes and is NOT in CI. Pre-existing, unrelated:
+it only shortens `LOGIN_RETRY_BACKOFF`, not `LOGIN_TOTAL_BUDGET` (1200s), so it sits in the
+long-retry phase. `verify_login_resilient.py` is its working successor.
+
+### Files
+
+```
+server_run.py                     start / stop / status / selfcheck
+egress.py                         fail-closed KR egress + guard thread
+~/.ezloan-server/5136338/         run.log, run.pid, STOP, state.json, session.json (0600),
+                                  seen-posts.json, chrome-profile/   (outside the repo)
+```
+
+Env knobs (all optional, all defaulted): `EZLOAN_EGRESS_SSH` (unicorn@external-1),
+`EZLOAN_EGRESS_PORT` (1085), `EZLOAN_EGRESS_EXPECT_IP` (13.124.160.237),
+`EZLOAN_EGRESS_COUNTRY` (KR), `EZLOAN_SERVER_DIR`, `EZLOAN_REMOTE_SOURCE`.
+Set `--expect-ip ''` only if you switch nodes and have not re-pinned yet.
+
+Auto-update stays OFF and `version-ezloan-desktop.json` was not touched. Nothing was
+published to the static host.

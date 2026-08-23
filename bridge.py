@@ -101,7 +101,12 @@ class OwnerCaptchaBridge:
         deadline = time.time() + self.timeout
         while time.time() < deadline:
             try:
-                r = requests.get(url, timeout=8, headers={"Cache-Control": "no-cache"})
+                # 캐시버스터 쿼리를 반드시 붙인다. 이 파일은 사장님이 캡차가 뜬 뒤에야
+                # 올리므로, 첫 폴링은 404 를 받고 Cloudflare 엣지가 그 404 를 캐시한다.
+                # 요청 헤더 Cache-Control 만으로는 엣지 캐시가 확실히 무시되지 않아,
+                # 정답을 올려도 프로그램은 한동안 404 만 계속 보게 된다.
+                r = requests.get(f"{url}?cb={int(time.time() * 1000)}", timeout=8,
+                                 headers={"Cache-Control": "no-cache"})
                 if r.status_code == 200 and r.text.strip():
                     raw = r.text.strip()
                     # 'token|answer' 는 토큰 일치할 때만, 아니면 그대로 정답
