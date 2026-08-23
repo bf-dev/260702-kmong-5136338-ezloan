@@ -76,8 +76,10 @@ def main():
 
     # logged_in 은 항상 True (세션/계정 정상). 거짓 재로그인 루프가 나면 이 값이 무시된 것.
     eb.logged_in = lambda s: True
-    # company_rank 는 등록 성공 검증용 - 등록된 글엔 순위 1 을 준다.
-    eb.company_rank = lambda s, pid, company=config.COMPANY_NAME: (1 if int(pid) in REGISTERED_BY_APP else 0)
+    # 순위 읽기는 등록 성공 검증용 - 등록된 글엔 순위 1(위에 아무도 없음) 을 준다.
+    eb.rank_and_above = lambda s, pid, company=config.COMPANY_NAME: (
+        (1, []) if int(pid) in REGISTERED_BY_APP else (0, []))
+    eb.company_rank = lambda s, pid, company=config.COMPANY_NAME: eb.rank_and_above(s, pid, company)[0]
 
     results = {}
 

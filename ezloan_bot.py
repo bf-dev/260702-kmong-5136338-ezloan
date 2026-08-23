@@ -472,19 +472,53 @@ def lookahead_ids(s, frontier, window):
 # 예전 company_rank 는 페이지 전체 <li>(네비/푸터 포함)를 세어 상호가 늘 ~147번째로 나와
 # 실제 배너 순위(1~9위대)와 무관한 값을 로그에 남겼다. 이제 '진짜 배너 항목'만 세어 실제
 # 상단 순위(1등/2등)를 보고한다 -> 로그의 rank 가 곧 고객이 사이트에서 보는 그 순위다.
+#
+# 2026-08-23 정정 (중요): 위 문장은 절반만 맞았다. 예전 정규식
+#
+#     <a href="/l/\d+" class="item[^"]*"[^>]*>\s*<div class="name">([^<]*)</div>
+#
+# 은 name div 안에 자식 태그가 없는 항목만 잡는다. 그런데 유료 등급(ad_sm / ad_lg) 광고주의
+# 실제 마크업에는 배지 span 이 하나 더 들어 있다:
+#
+#     <div class="name">옥자대부 <span class="m_hide">정식등록 8개월</span></div>
+#
+# ([^<]*)</div> 가 여기서 실패하므로 ad_sm/ad_lg 광고주는 목록에서 통째로 사라졌다. 32004 글
+# 기준 9개 배너 중 4개(544 옥자대부, 310, 408, 535)가 빠졌고, 하필 그 중 하나가 고객이 계속
+# 지목해 온 경쟁사 옥자대부(544)다. 결과: 옥자대부가 1번 슬롯을 잡고 우리가 2번인 글에서도
+# 로그에는 rank=1 이 찍혔다. 2026-07-17 ~ 08-22 의 [registered] rank=1 로그는 전부 이 오류의
+# 산물이다(실측 대조 2026-08-23: 31940~31984 중 우리가 실제 1슬롯인 글은 0건, 대부분 2슬롯).
+#
+# 그래서 이제 name div 대신 <a> 의 title 속성("{상호}-{홍보문구}")에서 상호를 읽는다. title 은
+# 배지 유무와 무관하게 항상 붙고 자식 태그가 없다. 목록 범위도 실제 배너 ul 로 한정한다.
+_BANNER_LIST_RE = re.compile(
+    r'<ul class="section_body loan_list recommend">(.*?)</ul>', re.S)
 _BANNER_ITEM_RE = re.compile(
-    r'<a href="/l/\d+" class="item[^"]*"[^>]*>\s*<div class="name">([^<]*)</div>')
+    r'<a href="/l/(\d+)" class="(item[^"]*)"[^>]*title="([^"]*)"', re.S)
 
-def company_rank(s, pid, company=config.COMPANY_NAME):
+
+def banner_order(html):
+    """[(광고주id, 상호, css class), ...] - 페이지에 보이는 그대로의 노출 순서."""
+    m = _BANNER_LIST_RE.search(html or "")
+    body = m.group(1) if m else (html or "")
+    return [(aid, title.split("-", 1)[0].strip(), cls.strip())
+            for aid, cls, title in _BANNER_ITEM_RE.findall(body)]
+
+
+def rank_and_above(s, pid, company=config.COMPANY_NAME):
+    """(우리 슬롯, 우리 위에 있는 광고주들). 슬롯 0 = 아직 목록에 없음."""
     try:
         r = s.get(f"{config.BASE_URL}/rq/{pid}", timeout=10)
     except Exception:
-        return 0
-    names = [n.strip() for n in _BANNER_ITEM_RE.findall(r.text)]
-    for idx, name in enumerate(names, 1):
+        return 0, []
+    order = banner_order(r.text)
+    for idx, (_aid, name, _cls) in enumerate(order, 1):
         if company in name:
-            return idx
-    return 0
+            return idx, [f"{n}({a})" for a, n, _c in order[:idx - 1]]
+    return 0, []
+
+
+def company_rank(s, pid, company=config.COMPANY_NAME):
+    return rank_and_above(s, pid, company)[0]
 
 
 def register(s, pid, company=config.COMPANY_NAME, precheck=None):
@@ -552,14 +586,18 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
                 "session_lost": _is_session_lost_msg(add_msg),
                 "amount": check_amount,
                 "body": (r.text or "")[:300]}
-    rank = company_rank(s, pid, company)
-    for _ in range(3):
+    # 순위 확인은 등록 성공 '후'의 읽기라 핫패스가 아니다. 순위만이 아니라 '누가 우리 위에
+    # 있는지'까지 남긴다 - 1등을 못 잡았을 때 상대가 누구인지가 진단의 핵심이기 때문이다.
+    rank, above = 0, []
+    for attempt in range(4):
+        if attempt:
+            time.sleep(0.15)
+        rank, above = rank_and_above(s, pid, company)
         if rank:
             break
-        time.sleep(0.15)
-        rank = company_rank(s, pid, company)
     return {"ok": True, "rank": rank, "note": "registered" if rank else "registered_not_verified",
-            "status": 200, "msg": add_msg or "success", "amount": check_amount}
+            "status": 200, "msg": add_msg or "success", "amount": check_amount,
+            "above": above}
 
 
 class Registrar:
@@ -1436,7 +1474,11 @@ class Registrar:
                 self._post_absent_pid = None
                 self._post_absent_streak = 0
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
-            self.remote("registered", f"post={pid} rank={result['rank']} msg={msg}", force=True)
+            above = result.get("above") or []
+            self.remote("registered",
+                        f"post={pid} rank={result['rank']} msg={msg}"
+                        + (f" 위에={','.join(above)}" if above else " 위에=없음(1등)"),
+                        force=True)
         elif result.get("ok"):
             self._registered_total += 1
             self._session_lost_streak = 0
