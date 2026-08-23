@@ -554,6 +554,13 @@ def cmd_selfcheck(args):
                     found[f"{how}={sel}"] = f"{len(els)} ({len(vis)} visible)"
                     if vis and submit_hit is None:
                         submit_hit = sel
+                # Guardrail evidence: prove that a bare `button.btn_done` would grab the
+                # PASSKEY button. naver_login.py deliberately never uses that selector, and
+                # this line is what keeps that claim measured instead of remembered.
+                done_ids = [(e.get_attribute("id") or "?",
+                             e.is_displayed()) for e in
+                            driver.find_elements("css selector", "button.btn_done")]
+                log(f"[selfcheck]   button.btn_done in DOM order={done_ids}")
                 blocked = [m for m in ("보호조치", "새로운 기기", "idSafetyRelease", "점검")
                            if m in html]
                 log(f"[selfcheck] naver oauth form at {driver.current_url[:70]}...: "
