@@ -1971,3 +1971,159 @@ record from the slot order is 1 win / 2 posts here, and 4 wins / 5 posts countin
 full external-8 run (32015 W, 32016 W, 32017 W, 32018 W, 32019 L). **Do not tell the
 customer anything about 1등 off this.** Let the sampler run; posts arrive every 15-45
 minutes, so a day gives 30-50 rows.
+
+### 07:55Z — CAN WE TAKE SLOT 1 FROM 옥자대부? The join finally has both sides
+
+Short version: **yes, it is winnable, and we have already won it 4 times off the page.
+What is NOT yet determinable is whether we win it MOST of the time; N is 7.**
+
+#### The bug that was hiding the answer
+
+`race_join.py` read our registration timestamps from
+`artifacts/works-logs/5136338/pending-ingest.log`. **That file is a per-turn snapshot.**
+The gateway writes it before an agent turn and unlinks it after, so between turns the join
+read zero registrations and printed `n=0` while looking perfectly healthy. The one run
+that produced `n=2` happened to fire while a turn was in flight. This is the same trap
+that is already in global memory as "pending-ingest.log is a snapshot"; it bit us again
+here.
+
+The durable copy is the gateway's own Postgres, and it goes back to 2026-08-05:
+
+```sql
+SELECT "createdAt", source, text FROM "IngestedLog"
+ WHERE "customerKey" = '5136338' AND text LIKE '[registered] post=%' ORDER BY "createdAt";
+```
+
+712 rows today. **Watch the column names: they are the reverse of what they read like.**
+`customerKey` holds the Kmong partner id (`5136338`) and `customerId` holds the internal
+uuid (`d3b89a47-...`). Querying `customerId='5136338'` returns zero rows and looks like
+"the loop never reported". `race_join.py` now reads the DB (`docker exec neoworks-postgres
+psql`), with `--ingest-log` left as a fallback.
+
+#### 1) Per-post join, page-open to registration
+
+t0 is the moment ezloan **allocates the post id** (the "armed" skeleton starts answering).
+That is the only anchor an outside observer gets. The write gate opens ~8.6s later; the
+banner list only renders into the anonymous page ~17s after alloc, which is why the
+opponent is left-censored on almost every row (see the 06:31Z anchor section above).
+
+```
+post   alloc(UTC)      ->OUR reg   ->list renders   slot us/544   W/L   544 bracketed to
+32005  -               -           -                None / 1      -     render+140ms
+32018  05:52:03.723Z    8.752s     17.726s          1 / 2         W     8.752 .. 17.726
+32019  06:31:12.503Z    8.880s     17.029s          2 / 1         L     8.557 ..  8.880
+32020  07:08:58.491Z    8.829s     16.918s          2 / 1         L     8.557 ..  8.829
+32021  -                -          -                1 / 2         W     -
+32022  07:25:28.419Z    9.154s     16.310s          2 / 1         L     8.557 ..  9.154
+```
+
+Our alloc -> registration: **n=4, min 8.752 / p50 8.855 / p90 9.072 / max 9.154 s**
+(gateway ingest lag of 0.47s already subtracted, +-0.15s). 32021 has our registration but
+no alloc: the sampler was still finishing 32020 and arrived after 32021's list had already
+rendered, so its `open_wall_utc` is not a first render and `armed_lead_s` is null. Leave it
+unjoined rather than reconstructing it.
+
+Our own share of that 8.75-9.15s is at most **0.195s**: `FRONTIER_POLL_SECONDS = 0.15`
+(config.py, and no `EZLOAN_FRONTIER_POLL_SECONDS` override on the live loop, verified from
+`/proc/<pid>/environ`) plus one ~45ms RTT to ezloan. The loop re-fires the write every tick
+while a fresh post answers "no permission", so the first success lands within one tick of
+the gate opening. **The spread of our own numbers (402ms) is wider than our entire
+controllable overhead (195ms), so most of that jitter is ezloan's gate, not us.**
+
+#### 2) 옥자대부's distribution, with the honest N
+
+- **Directly timed: n = 1.** Post 32005, 140ms after the list rendered, bracket +-250ms.
+  One point is not a distribution, and it is measured against the wrong anchor anyway (it
+  means 옥자대부 was ~8s LATE on that post, not that it is a 140ms competitor). Reporting
+  min/p50/p90/max off it would be theatre: they are all 140.
+- **Bracketed by the slot order: n = 4.** This is the measurement that actually works. DOM
+  order == registration order, so on a post where both of us registered, our millisecond
+  timestamp bounds theirs from one side:
+
+  ```
+  we are ABOVE 544  ->  t_544 > t_585   (and <= alloc_to_render, since it was already on
+                                         the list the first time the list rendered)
+  we are BELOW 544  ->  t_544 < t_585   (and >= the gate floor: nobody registers before
+                                         ezloan opens the write API)
+  ```
+
+  Gate floor = our fastest registration minus our own tick+RTT = **8.557s**.
+  On the 3 posts it beat us, 옥자대부 registered inside **8.557 .. 8.829 / 8.880 / 9.154 s**
+  after alloc, i.e. **within roughly 270-600ms of the gate opening.**
+
+**So: 옥자대부 is a millisecond-class poller sitting at the gate, exactly like us. Delete
+the "140ms" framing entirely.** The race is not "get under 140ms", it is "be the first of
+two pollers through a gate that both of us reach within ~0.3s".
+
+#### 3) Our achieved slot, read off the page (never the app's rank= field)
+
+`slot_audit_kr.py` (new, stdlib, read-only, runs on the KR host) re-reads
+`<ul class="section_body loan_list recommend">` for a band of posts. Full run on
+31960-32022 from unicorn@external-2: 57 of 63 pages still exist, we are on 42, slot 1 on 5.
+Raw head-to-head is 5/42, but that number is meaningless mixed together, because the loop
+changed underneath it:
+
+```
+regime                                          posts   head-to-head   slot-1 wins   rate    95% CI
+A  customer PC, v2.5.5 (Windows, home net)     31960-31984      23           0        0%    [ 0%, 14%]
+B  server run, before the 04:56Z restart       32003-32014       8           1       12%    [ 2%, 47%]
+C  server run on external-8, direct KR egress  32015-32022       7           4       57%    [25%, 84%]
+```
+
+Fisher exact, C vs A+B: **p = 0.0022.** That is a real regime change, not noise. Wins in C
+are 32016, 32017, 32018, 32021. (32015 was a win when audited at 06:35Z but its page has
+since been removed by the requester, so it is not counted here. 32014 was a restart
+catch-up, slot 8, expected.)
+
+Two things worth stating because they refute the obvious objections:
+
+- **There is no paid-tier priority to beat.** 옥자대부 carries `class="item ad_sm"` and
+  365저금리대부 `class="item ad_lg"`; our 585 is a bare `class="item"`. On 32016/32017/
+  32018/32021 the bare `item` sits above both paid classes. Slot order is arrival order,
+  full stop. If ordering were bought, those four posts could not exist.
+- **The app's own `rank=` field still cannot be used.** Today's rows are almost all
+  `rank=미확인`, and the one that reports a number (32014, `rank=8`) happens to match the
+  page. The 43 false `rank=1` rows are the pre-fix regex. Always audit from the page.
+
+#### 4) Verdict
+
+**Winnable: demonstrated.** Not a projection: four posts where the page shows 더원대부중개
+at slot 1 with 옥자대부 at slot 2, under the current configuration, inside 2.5 hours.
+
+**Winnable consistently: not yet determinable.** 4/7 with a 95% CI of [25%, 84%] is
+compatible with "we win a third of the time" and with "we win four fifths of the time".
+It needs a day, not two hours: posts arrive every 15-45 minutes, so ~30-50 head-to-head
+rows by tomorrow morning would put the CI inside about +-15 points.
+
+**What must NOT be said to the customer yet:** anything shaped like "이제 1등입니다" or a
+percentage. The honest sentence today is "지금 설정에서 옥자대부를 실제로 몇 번 눌렀고,
+비율은 내일까지 데이터를 더 모아야 말씀드릴 수 있습니다".
+
+**The lever, if we want the rate higher:** our controllable overhead is the 0.15s tick plus
+one 45ms RTT. Halving the tick to 0.08s would cut the worst case by ~75ms out of a race
+decided inside ~300ms, which is material. It also doubles the write rate against ezloan on
+every armed post, so it is a deliberate decision with the owner, not a silent tune. Do not
+change it off this note alone.
+
+#### Where the data and the tools are
+
+```
+race_join.py            joins sampler alloc x our [registered] ms; reads the gateway DB now
+                        cron */5 on the gateway (bfdev@main), flock, uploads source ezloan-race-join
+                        --print  join+print only     --slot-audit <file>  page-truth slots
+                        --ingest-log  fall back to the per-turn snapshot (usually 0 rows)
+slot_audit_kr.py        achieved-slot audit from the page; stdlib, read-only, runs on the
+                        KR host; --upload posts to source ezloan-race-slotaudit
+~/.ezloan-race-join/    joined.jsonl, report.txt, slot_audit.jsonl, cron.log   (gateway host)
+```
+
+Both datasets are uploaded to the Artifacts API under customer 5136338, so neither dies
+with its host this time: `ezloan-race-join` (id 7f11b2cd) and `ezloan-race-slotaudit`
+(id 18106509), both `matched=true`. Re-run `slot_audit_kr.py` on external-2 before the next
+join so the page-truth slots cover the newest posts.
+
+**The sampler is still running.** `unicorn@external-2`, pid group under
+`~/ezloan-sampler/race_sampler_run.sh`, cron `*/2` watchdog + `@reboot`, waiting on post
+32023 as of 07:28Z. Leave it: it is the only thing growing N. Stop only with
+`ssh unicorn@external-2 'crontab -r'` then `pkill -f race_sampler` from a plain shell (not
+inside a one-line `ssh 'a; b; c'`, which kills its own ssh).
