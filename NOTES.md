@@ -1551,6 +1551,24 @@ What is NOT claimed: nobody has yet observed us take slot 1 against a live 옥�
 than twice (31040, 32004). The competitor number is one post (32005) at 140 ms; more
 samples are being collected by `race_watch_kr.py` on external-1.
 
+### 1c. DOM order IS what the customer sees (verified on real pixels)
+
+The whole audit rests on "DOM order == exposure order", so it was checked in a real
+browser through the KR egress rather than assumed. Headless Chrome 152, post 32004:
+
+```
+mobile  430x2400 (single column)     1 585 더원대부중개 / 2 544 옥자대부 / 3 545 서일대부 ...
+desktop 1440x2400 (3-column grid)    1 585 (y1100,x132) / 2 544 (y1100,x399) / 3 545 (y1100,x666) ...
+```
+
+Reading order (y then x) matches DOM order exactly at both widths, and `ad_sm` only
+changes a badge colour and the coin icon in `layout.css` (no `order:`, no reordering).
+Screenshot: `tmp/ezloan-race/rq32004_mobile.png`.
+
+Side note worth raising with the customer: 옥자대부 carries a green `정식등록 8개월` badge
+and several others carry theirs; 더원대부중개 has no badge at all. That is a separate
+ezloan product from the 실시간 배너, and it is visible on every single listing.
+
 ### Tools added (all read-only, all anonymous, none of them log in or write)
 
 ```
