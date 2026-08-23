@@ -55,6 +55,7 @@ Exit codes: 0 stop requested, 3 crash, 4 session dead (parent should re-login an
 relaunch), 5 egress violation, 6 keepalive lost.
 """
 
+import fcntl
 import json
 import os
 import sys
@@ -64,7 +65,10 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-KEEPALIVE_TIMEOUT = 90.0
+# How long an orphan may outlive the gateway that launched it. Deliberately short: the
+# gateway waits this out before it dares start a replacement loop anywhere, so it is also
+# the worst-case gap in coverage after an ssh dies badly.
+KEEPALIVE_TIMEOUT = 45.0
 SEEN_WATCH_SECONDS = 5.0
 
 EXIT_OK = 0
@@ -72,6 +76,7 @@ EXIT_CRASH = 3
 EXIT_SESSION_DEAD = 4
 EXIT_EGRESS = 5
 EXIT_KEEPALIVE = 6
+EXIT_ALREADY_RUNNING = 7
 
 
 _out_lock = threading.Lock()
@@ -91,7 +96,38 @@ def log(text):
     emit("LOG", str(text).replace("\n", " ⏎ ")[:2000])
 
 
+def acquire_single_instance_lock():
+    """At most one Registrar per host, enforced by the OS rather than by good intentions.
+
+    The ezloan account is single-session. The gateway already refuses to launch a second
+    loop, but an ssh that dies badly can leave this process running while the gateway,
+    seeing its channel drop, reasonably concludes it should start a replacement. A flock
+    is the only thing that makes "exactly one" true no matter how the ssh died: the second
+    process cannot take the lock, so it exits instead of racing the first one.
+
+    Returns the held file object (which must stay referenced for the lock to persist), or
+    None if another instance holds it.
+    """
+    path = os.path.join(HERE, "loop.lock")
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(f"{os.getpid()} {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+    fh.flush()
+    return fh
+
+
 def main():
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        emit("EXIT", f"{EXIT_ALREADY_RUNNING} another remote_loop.py already holds the "
+                     f"single-instance lock on this host; refusing to race the same "
+                     f"ezloan session")
+        return EXIT_ALREADY_RUNNING
+
     raw = sys.stdin.readline()
     if not raw.strip():
         emit("EXIT", f"{EXIT_CRASH} no startup payload on stdin")

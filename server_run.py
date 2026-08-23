@@ -407,6 +407,12 @@ LOOP_FILES = ("remote_loop.py", "ezloan_bot.py", "config.py", "egress.py", "brid
 _LOOP_EXIT_OK = 0
 _LOOP_EXIT_SESSION_DEAD = 4
 _LOOP_EXIT_EGRESS = 5
+_LOOP_EXIT_ALREADY_RUNNING = 7
+# Must be >= remote_loop.KEEPALIVE_TIMEOUT. When the remote did not report @@EXIT we do
+# not know it is dead, so this is how long we wait for its own watchdog to kill it before
+# we start any replacement loop. The ezloan account is single-session; a few seconds of
+# no coverage is cheap, two loops racing the same session is not.
+_LOOP_ORPHAN_GRACE = 55.0
 
 
 def _deploy_loop(args, log):
@@ -429,6 +435,39 @@ def _deploy_loop(args, log):
                            f"{(p.stdout or b'').decode('utf-8', 'replace')[:400]}")
     log(f"[loop] deployed {len(LOOP_FILES)} files to {args.loop_host}:{args.loop_dir} "
         f"({len(payload)} bytes)")
+
+
+def _confirm_remote_dead(args, log, timeout=25):
+    """Best effort: kill any surviving remote loop and confirm none is left.
+
+    Returns True only when we positively observed zero remote_loop.py processes on the
+    host. Unreachable host, ssh failure, ambiguous output: all False, because "I could not
+    check" must never be read as "it is gone".
+    """
+    # The [l] is not a typo. pgrep -f matches against full command lines, and this very
+    # ssh command IS a command line on that host, so a plain "remote_loop.py" pattern
+    # counts itself and the check can never read zero. "remote_[l]oop.py" matches the real
+    # process but not the literal text of the checking command.
+    pat = "python3 -u remote_[l]oop.py"
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+           "-o", f"ConnectTimeout={int(timeout)}", args.loop_host,
+           f"pkill -f '{pat}'; sleep 2; pgrep -fc '{pat}' || echo 0"]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout + 15)
+    except Exception as e:
+        log(f"[loop] could not reach {args.loop_host} to check for a surviving loop: {e}")
+        return False
+    out = (p.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+    tail = out[-1].strip() if out else ""
+    if p.returncode != 0:
+        log(f"[loop] orphan check on {args.loop_host} failed rc={p.returncode}: {tail[:200]}")
+        return False
+    if tail == "0":
+        log(f"[loop] confirmed no remote loop is running on {args.loop_host}")
+        return True
+    log(f"[loop] {args.loop_host} still reports {tail} remote_loop.py process(es)")
+    return False
 
 
 def _read_seen():
@@ -565,9 +604,27 @@ def _run_remote_loop(args, creds, cookies, ip, should_stop, stop_event, log, rem
         log(f"[loop] the remote loop exited rc={rc} after {uptime:.0f}s "
             f"({exit_code['reason'] or 'no reason reported'})")
 
+        # If the remote never reported @@EXIT, the ssh died without us hearing from the
+        # loop, so we do NOT know it is dead. Try to kill it, and if we cannot even reach
+        # the host, wait out its own keepalive watchdog before starting anything else.
+        # This is the whole single-session guarantee: it must hold even when the network
+        # is what broke.
+        if exit_code["v"] is None and not should_stop():
+            if not _confirm_remote_dead(args, log):
+                log(f"[loop] could not confirm the remote loop is gone; waiting "
+                    f"{_LOOP_ORPHAN_GRACE:.0f}s for its own watchdog before starting any "
+                    f"replacement, so the ezloan session is never raced")
+                if stop_event.wait(_LOOP_ORPHAN_GRACE):
+                    return True
+
         if should_stop():
             return True
-        if rc == _LOOP_EXIT_OK:
+        if rc == _LOOP_EXIT_ALREADY_RUNNING:
+            # Another loop holds the lock on that host. Never start a second one; wait for
+            # the first to release it.
+            log("[loop] a loop is already running on that host; backing off")
+            attempts += 1
+        elif rc == _LOOP_EXIT_OK:
             # It ended cleanly without us asking. Treat as a restart, not a fallback.
             attempts += 1
         elif rc == _LOOP_EXIT_SESSION_DEAD:
