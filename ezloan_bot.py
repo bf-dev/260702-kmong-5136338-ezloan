@@ -61,11 +61,23 @@ _POST_PAGE_MARKERS = ("배너 등록을 눌러 주세요", "js-memberConfirmView
 # 실제 글은 293,249바이트 전체 페이지 + 위 마커들. 상태코드는 둘 다 200 이므로
 # 크기/마커로만 가를 수 있다. 로그인 여부와 무관하게 동일하게 판별된다(실측 확인).
 _POST_MISSING_MARKER = "존재하지 않은"
-NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads", "no_permission",
+NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads",
                  # 글은 실재하지만 이 회원 배너가 이미 있거나(재등록 불가) 지금 계정 상태로
                  # 등록 대상이 아님. rq_addbanner 가 result:false('404 error'/'no permission')
                  # 를 주는 개별-글 등록 거부. 세션 사망 아님 -> seen 처리하고 프런티어 전진.
                  "add_refused"}
+# 'no_permission' 은 2026-08-23 에 NON_RETRYABLE 에서 뺐다. 라이브 증거(글 32005):
+#   03:07:37.778  post_live=True -> rq_addbanner_check -> {result:false, msg:"no permission"}
+#                 -> 예전 코드: seen 처리 + 프런티어 전진 -> 이 글은 영영 포기
+#   03:07:56.208  /rq/32005 가 배너 <ul> 를 가진 완전한 페이지로 처음 렌더됨(= 등록 개시)
+#   03:07:56.35   옥자대부(544) 배너 등장 (개시 +0.14s)
+#   최종          배너 7개, 우리(585)는 없음
+# 즉 이지론은 글 번호를 먼저 채번해 페이지를 부분적으로 서빙하고, '배너 등록 개시'는 그보다
+# 18.4초 늦게 열렸다. 그 창 안의 'no permission' 은 계정 문제가 아니라 '아직 안 열림'이다.
+# post_absent 와 정확히 같은 계열의 실수였다(2026-07-27 참조). 이제 같은 글 번호에 대해
+# NO_PERM_RETRY_SECONDS 동안 체크를 계속 두드리다가 열리는 순간 쏘고, 그 시간을 넘기면
+# 그제서야 계정 측 거부로 보고 포기한다. 부수 효과가 본체다: 개시 전에 이미 대기 중이므로
+# 개시 순간의 등록 지연이 '감지 지연 + 왕복'이 아니라 '체크 tick 하나'로 줄어든다.
 # 'post_absent' 는 절대 NON_RETRYABLE 에 넣지 않는다(2026-07-27 실제 재현, 고객 5136338).
 # v2.4.6 이 'open' 후보를 post_exists 확인 없이 즉시 rq_addbanner 로 등록하도록 바꾼 뒤,
 # 실전에서 'rq_addbanner_check 는 통과(계정 정상)했지만 글 페이지가 아직 안 뜬' 찰나의 경쟁이
@@ -504,6 +516,10 @@ def banner_order(html):
             for aid, cls, title in _BANNER_ITEM_RE.findall(body)]
 
 
+# 등록 직후 순위 재확인 간격(초). 첫 시도는 즉시, 이후 점점 늘려 총 ~8초까지 본다.
+RANK_READBACK_DELAYS = (0, 0.3, 0.6, 1.2, 2.0, 4.0)
+
+
 def rank_and_above(s, pid, company=config.COMPANY_NAME):
     """(우리 슬롯, 우리 위에 있는 광고주들). 슬롯 0 = 아직 목록에 없음."""
     try:
@@ -588,10 +604,13 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
                 "body": (r.text or "")[:300]}
     # 순위 확인은 등록 성공 '후'의 읽기라 핫패스가 아니다. 순위만이 아니라 '누가 우리 위에
     # 있는지'까지 남긴다 - 1등을 못 잡았을 때 상대가 누구인지가 진단의 핵심이기 때문이다.
+    # 예전엔 0.15s 씩 4번(총 ~0.95s)만 보고 포기해 rank=미확인 이 자주 찍혔다(2026-08-23
+    # 서버 실행의 32003/32004 둘 다). 등록 직후 목록에 우리가 반영되기까지 1초 이상 걸릴 때가
+    # 있고, 이 읽기는 쓰기가 끝난 뒤라 경쟁과 무관하므로 넉넉히 기다리는 쪽이 항상 이득이다.
     rank, above = 0, []
-    for attempt in range(4):
-        if attempt:
-            time.sleep(0.15)
+    for delay in RANK_READBACK_DELAYS:
+        if delay:
+            time.sleep(delay)
         rank, above = rank_and_above(s, pid, company)
         if rank:
             break
@@ -652,6 +671,10 @@ class Registrar:
         # '진짜 새로 생긴 글마다 전부' 거부되는 경우에만(=연속 임계 초과) 계정 힌트를 한 번 알린다.
         self._no_perm_streak = 0
         self._no_perm_warned = False   # 계정 힌트 알림은 상태당 1회만(재알람 방지)
+        # 'no permission' 을 곧바로 포기하지 않고 '아직 등록 개시 전'으로 보고 붙잡아 두는 창.
+        self._no_perm_retry_pid = None
+        self._no_perm_retry_since = 0.0
+        self._no_perm_retry_n = 0
         self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
         # post_absent 재시도 추적('체크는 open인데 페이지가 아직 안 뜬' 찰나의 경쟁, pid 는
         # 항상 현재 frontier 이므로 같은 pid 가 연속으로 재확인된다). 같은 pid 가 이 횟수 넘게
@@ -1470,6 +1493,7 @@ class Registrar:
             self._fresh_refuse_streak = 0
             self._no_perm_streak = 0
             self._no_perm_warned = False
+            self._no_perm_retry_pid = None
             if pid == self._post_absent_pid:
                 self._post_absent_pid = None
                 self._post_absent_streak = 0
@@ -1486,6 +1510,7 @@ class Registrar:
             self._fresh_refuse_streak = 0
             self._no_perm_streak = 0
             self._no_perm_warned = False
+            self._no_perm_retry_pid = None
             if pid == self._post_absent_pid:
                 self._post_absent_pid = None
                 self._post_absent_streak = 0
@@ -1510,13 +1535,40 @@ class Registrar:
             # 스킵'을 계정/배너 문제로 단정해 매번 확인을 요구하지 않는다. 개별-글 스킵은 조용히
             # (중립 문구로) 넘긴다. 계정 관련 힌트는 '진짜 새로 생긴 글마다 전부' 거부될 때만
             # (=연속 임계 초과) 딱 한 번 띄운다(실제 증거가 있을 때만).
-            self._no_perm_streak += 1
-            self.log("이미 처리했거나 지금 등록 대상이 아닌 건이라 건너뜁니다. (로그인·자동등록은 정상 동작 중)")
+            # 2026-08-23: 여기서 곧바로 포기하지 않는다. 새 글은 '번호는 났는데 배너 등록이
+            # 아직 안 열린' 창(글 32005 실측 18.4초)에 있을 수 있고, 그 창의 'no permission'
+            # 은 계정 문제가 아니라 타이밍이다. NO_PERM_RETRY_SECONDS 동안 같은 글 번호를
+            # 붙잡고 매 tick 체크를 다시 두드린다(체크는 47바이트, 쓰기 아님 - 잔여 소모 없음).
+            # 열리는 순간 그 tick 에서 바로 rq_addbanner 가 나가므로, 이 경로는 버그 수정인
+            # 동시에 1등 경쟁에서 가장 유리한 자리(개시 전 대기)를 잡아 준다.
+            now = time.time()
+            if pid != self._no_perm_retry_pid:
+                self._no_perm_retry_pid = pid
+                self._no_perm_retry_since = now
+                self._no_perm_retry_n = 0
+            self._no_perm_retry_n += 1
+            waited = now - self._no_perm_retry_since
             amt = "미확인" if self._last_amount is None else self._last_amount
+            if waited < config.NO_PERM_RETRY_SECONDS:
+                # 아직 대기 창 안 - seen 에 넣지 않고 프런티어도 붙잡아 둔다.
+                self.remote(
+                    "register_no_permission_wait",
+                    f"post={pid} status={status} msg={msg} note={note} "
+                    f"(아직 등록 개시 전으로 보고 대기 - {waited:.1f}s/{config.NO_PERM_RETRY_SECONDS:.0f}s, "
+                    f"재시도={self._no_perm_retry_n}회, 마지막배너잔여={amt})",
+                    force=(self._no_perm_retry_n == 1),
+                )
+                return False
+            # 대기 창을 넘겼다 -> 이제서야 계정 측 거부로 본다(예전 동작).
+            self._no_perm_retry_pid = None
+            self._no_perm_streak += 1
+            self.seen.add(pid)
+            self._write_seen()
+            self.log("이미 처리했거나 지금 등록 대상이 아닌 건이라 건너뜁니다. (로그인·자동등록은 정상 동작 중)")
             self.remote(
                 "register_no_permission",
                 f"post={pid} status={status} msg={msg} note={note} "
-                f"(로그인 유효, 이 글은 현재 등록 대상 아님 - 개별-글 스킵, "
+                f"(로그인 유효, {config.NO_PERM_RETRY_SECONDS:.0f}초 대기 후에도 거부 - 개별-글 스킵, "
                 f"새글연속거부={self._no_perm_streak} 마지막배너잔여={amt})",
                 # 개별 스킵은 조용히(디바운스), 연속 거부가 쌓일 때만 크게 알린다.
                 force=(self._no_perm_streak >= config.NO_PERM_WARN_STREAK),

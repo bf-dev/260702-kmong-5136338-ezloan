@@ -87,6 +87,14 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_restart_missed_posts.py
 
+      # 라이브 재현(글 32005, 2026-08-23): 이지론은 글 번호를 먼저 채번해 페이지를 부분적으로
+      # 서빙하고 배너 등록은 18.4초 뒤에 열린다. 그 창의 'no permission' 을 계정 거부로 오해해
+      # seen 처리 + 프런티어 전진 -> 그 글을 통째로 잃었다. v2.6.2 이하에서는 첫 사이클에 실패.
+      - name: Verify a not-yet-open new post is not given up on ('no permission' timing window)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_no_permission_not_open_yet.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8
