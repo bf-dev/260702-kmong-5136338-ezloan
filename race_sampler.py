@@ -212,8 +212,12 @@ def _pct(xs, p):
 
 def distribution(rows):
     """Distribution over every summary row collected so far."""
-    rival_t = [r["t_rival"] for r in rows if r.get("t_rival") is not None]
-    ours_t = [r["t_ours"] for r in rows if r.get("t_ours") is not None]
+    # censored rows are excluded from the timing distribution and counted on their own:
+    # all we know about them is "arrived at or before the list first rendered".
+    rival_t = [r["t_rival"] for r in rows
+               if r.get("t_rival") is not None and not r.get("rival_censored")]
+    ours_t = [r["t_ours"] for r in rows
+              if r.get("t_ours") is not None and not r.get("ours_censored")]
     brackets = [r["publish_bracket_s"] for r in rows if r.get("publish_bracket_s") is not None]
     h2h = [r for r in rows
            if r.get("slot_ours") is not None and r.get("slot_rival") is not None]
@@ -223,7 +227,9 @@ def distribution(rows):
         slots[str(s)] = slots.get(str(s), 0) + 1
     return {
         "posts": len(rows),
-        "rival_present": len(rival_t),
+        "rival_present": sum(1 for r in rows if r.get("t_rival") is not None),
+        "rival_censored": sum(1 for r in rows if r.get("rival_censored")),
+        "ours_censored": sum(1 for r in rows if r.get("ours_censored")),
         "rival_ms": {
             "n": len(rival_t),
             "min": round(min(rival_t) * 1000) if rival_t else None,
@@ -261,10 +267,15 @@ def render_report(rows, dist):
     lines.append("host unicorn@external-2 (KR 115.68.232.141), read-only anonymous GETs")
     lines.append("")
     lines.append("SAMPLE SIZE: n=%d posts observed from their publish moment" % dist["posts"])
-    lines.append("             옥자대부(544) present on %d of them" % dist["rival_present"])
+    lines.append("             옥자대부(544) registered on %d of them, of which %d are "
+                 "left-censored" % (dist["rival_present"], dist["rival_censored"]))
+    lines.append("             (left-censored = already on the list the first time the list "
+                 "rendered, so its arrival is only known to be <= t0 and it is EXCLUDED "
+                 "from the timings below)")
     r = dist["rival_ms"]
     lines.append("")
-    lines.append("옥자대부(544) arrival after the banner list first renders, ms:")
+    lines.append("옥자대부(544) arrival after the banner list first renders, ms "
+                 "(uncensored rows only):")
     lines.append("  n=%s  min=%s  p50=%s  p90=%s  max=%s  mean=%s"
                  % (r["n"], r["min"], r["p50"], r["p90"], r["max"], r["mean"]))
     o = dist["ours_ms"]
@@ -520,6 +531,8 @@ class Sampler:
             "arrivals": arrivals,
             "t_rival": seen.get(RIVAL, {}).get("t") if RIVAL in seen else None,
             "t_ours": seen.get(OURS, {}).get("t") if OURS in seen else None,
+            "rival_censored": RIVAL in seen and seen[RIVAL]["t"] == 0.0,
+            "ours_censored": OURS in seen and seen[OURS]["t"] == 0.0,
             "final_order": final,
             "slot_ours": (final.index(OURS) + 1) if OURS in final else None,
             "slot_rival": (final.index(RIVAL) + 1) if RIVAL in final else None,
