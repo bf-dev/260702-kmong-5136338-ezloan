@@ -41,6 +41,7 @@ stdlib only: nothing has to be installed on the box.
 from __future__ import annotations
 
 import argparse
+import collections
 import gzip
 import http.client
 import json
@@ -214,6 +215,8 @@ def distribution(rows):
     rival_t = [r["t_rival"] for r in rows if r.get("t_rival") is not None]
     ours_t = [r["t_ours"] for r in rows if r.get("t_ours") is not None]
     brackets = [r["publish_bracket_s"] for r in rows if r.get("publish_bracket_s") is not None]
+    h2h = [r for r in rows
+           if r.get("slot_ours") is not None and r.get("slot_rival") is not None]
     slots = {}
     for r in rows:
         s = r.get("slot_ours")
@@ -238,12 +241,12 @@ def distribution(rows):
         },
         "our_slot_histogram": slots,
         "our_slot1_posts": sum(1 for r in rows if r.get("slot_ours") == 1),
-        "head_to_head": sum(1 for r in rows
-                            if r.get("t_ours") is not None and r.get("t_rival") is not None),
-        "head_to_head_wins": sum(1 for r in rows
-                                 if r.get("t_ours") is not None
-                                 and r.get("t_rival") is not None
-                                 and r["t_ours"] < r["t_rival"]),
+        "head_to_head": len(h2h),
+        "head_to_head_wins": sum(1 for r in h2h if r["slot_ours"] < r["slot_rival"]),
+        "delta_unresolved": sum(1 for r in h2h
+                                if r.get("t_ours") == r.get("t_rival")),
+        "delta_ms": sorted(round((r["t_rival"] - r["t_ours"]) * 1000) for r in h2h
+                           if r.get("t_ours") is not None and r.get("t_rival") is not None),
         "publish_bracket_ms": {
             "n": len(brackets),
             "p50": round(_pct(brackets, 0.50) * 1000) if brackets else None,
@@ -270,8 +273,18 @@ def render_report(rows, dist):
                  % (o["n"], o["min"], o["p50"], o["p90"], o["max"]))
     lines.append("우리 achieved slot histogram (slot->posts, null = not on the post): %s"
                  % json.dumps(dist["our_slot_histogram"], ensure_ascii=False))
-    lines.append("우리 slot 1: %d post(s).  head-to-head vs 544: %d/%d won"
-                 % (dist["our_slot1_posts"], dist["head_to_head_wins"], dist["head_to_head"]))
+    lines.append("우리 slot 1: %d post(s)." % dist["our_slot1_posts"])
+    lines.append("HEAD TO HEAD vs 옥자대부(544), decided by the resulting slot order: "
+                 "%d won / %d posts where both registered"
+                 % (dist["head_to_head_wins"], dist["head_to_head"]))
+    lines.append("  of those, %d finished inside a single observation (both banners already "
+                 "there the first time the list rendered), so the gap between us and 544 on "
+                 "those posts is smaller than the bracket below and is NOT resolved by this "
+                 "instrument. The order still tells you who was first."
+                 % dist["delta_unresolved"])
+    if dist["delta_ms"]:
+        lines.append("  t(544) - t(585) per post, ms (positive = we were earlier): %s"
+                     % dist["delta_ms"])
     b = dist["publish_bracket_ms"]
     lines.append("measurement error (publish bracket, ms): p50=%s max=%s  "
                  "-- every arrival above carries this" % (b["p50"], b["max"]))
@@ -308,11 +321,11 @@ class Sampler:
         Returns ("ok", (state, prelive)) | ("skip", None) | ("retry", None).
         Escalates the poll rate once the post id is allocated."""
         path = "/rq/%d" % pid
-        prelive = []
+        prelive = collections.deque(maxlen=600)
         stop = threading.Event()
         lock = threading.Lock()
         state = {"phase": "idle", "armed_at": None, "t0": None, "t0_wall": None,
-                 "banners": None, "last_not_open": None}
+                 "banners": None, "last_not_open": None, "armed_bytes": None}
         lookahead_deadline = [time.monotonic() + self.a.lookahead_seconds]
 
         def armed_now():
@@ -332,23 +345,27 @@ class Sampler:
                         stop.wait(0.05)     # extra threads idle until the id is allocated
                         continue
                     t = time.monotonic()
-                    n, phase, banners = parse(*c.get(path))
+                    status, html = c.get(path)
+                    n, phase, banners = parse(status, html)
                     now = time.monotonic()
                     with lock:
                         if stop.is_set():
                             return
-                        if len(prelive) < 4000:
-                            prelive.append({"t": round(now, 4), "bytes": n, "phase": phase})
+                        prelive.append({"t": round(now, 4), "bytes": n,
+                                        "phase": phase})
                         if phase == "full":
                             state["t0"] = now
                             state["t0_wall"] = time.time()
                             state["banners"] = banners
+                            self._dump_page(pid, "open", html)
                             stop.set()
                             return
                         state["last_not_open"] = now
                         if phase == "armed" and state["armed_at"] is None:
                             state["armed_at"] = now
                             state["phase"] = "armed"
+                            state["armed_bytes"] = n
+                            self._dump_page(pid, "armed", html)
                             self.log("[post %d] ARMED: id allocated, %d bytes, banner list "
                                      "not there yet -> escalating to %dx%.2fs"
                                      % (pid, n, self.a.armed_threads, self.a.armed_period))
@@ -383,6 +400,28 @@ class Sampler:
         for th in threads:
             th.join(timeout=3)
         return "ok", (state, prelive)
+
+    def _dump_page(self, pid, tag, html):
+        """One gzipped page per (post, tag). Bounded: the pages dir is swept to the last
+        40 files. This is the page-content evidence the artifacts standard asks for."""
+        try:
+            if not html:
+                return
+            d = os.path.join(os.path.dirname(self.summary_path), "pages")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "rq%d-%s.html.gz" % (pid, tag))
+            if os.path.exists(path):
+                return
+            with open(path, "wb") as fh:
+                fh.write(gzip.compress(html.encode("utf-8", "replace")))
+            files = sorted(os.listdir(d))
+            for stale in files[:-40]:
+                try:
+                    os.remove(os.path.join(d, stale))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def id_is_live(self, pid):
         c = Conn()
@@ -484,10 +523,11 @@ class Sampler:
             "final_order": final,
             "slot_ours": (final.index(OURS) + 1) if OURS in final else None,
             "slot_rival": (final.index(RIVAL) + 1) if RIVAL in final else None,
+            "armed_bytes": state.get("armed_bytes"),
             "sampler_host": self.a.host_label,
         }
         detail = dict(summary)
-        detail["prelive"] = prelive[-400:]
+        detail["prelive"] = [dict(r, t=round(r["t"] - t0, 3)) for r in prelive]
         detail["trace"] = trace
 
         _append(self.summary_path, summary)
