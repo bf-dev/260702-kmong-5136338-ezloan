@@ -1906,3 +1906,68 @@ race_watch_kr.py      SUPERSEDED by race_sampler.py. It has no daemon mode, no r
                       survival, and no Artifacts upload, which is exactly why the n=1
                       number died with external-1. Do not restart it.
 ```
+
+### 06:31Z — the 140ms anchor was wrong, and here is the page proof
+
+The first three sampled posts forced a correction that matters more than the sample size.
+`t0` was defined as "the moment `/rq/{id}` first renders its banner `<ul>`", and the whole
+"옥자대부 lands at 140ms, we need to get under it" framing rests on that being the moment
+registration opens. **It is not.** Three independent facts, all from this run:
+
+1. `<body data-cache="...">` on every `/rq/{id}` is the server's own unix second at render
+   time. It advances on every request (8 back-to-back probes at 06:33:59Z all returned
+   `1787466839`, and a probe a minute later returns that minute), so the page is rendered
+   fresh, not cached. It gives ezloan's clock, free, on every fetch.
+2. The pre-open ("armed") page is a **skeleton with no post content at all**: no
+   `meta description` with the loan request text, no `<ul class="section_body loan_list
+   recommend">`, zero `<a href="/l/N" class="item">`. Dumps kept at
+   `~/ezloan-sampler/pages/rq32019-armed.html.gz` and `rq32019-open.html.gz` on external-2.
+3. The timeline, cross-referencing the sampler against the loop's own `[registered]` rows:
+
+```
+post    id allocated (armed)   OUR loop registered      banner <ul> first renders
+32018   05:52:03.7Z            05:52:12Z   (+8.3s)      05:52:21.4Z   (+17.7s)
+32019   06:31:12Z              06:31:21Z   (+9.0s)      06:31:29.5Z   (+17.3s)
+```
+
+So the post id is allocated, registration opens roughly **9 seconds later**, and the banner
+list only renders into the anonymous page about **8 seconds after that**. The list appears
+~8s into a race that is already over for the fast entrants. That is why both 585 and 544
+are already on it the first time we can see it on 32018 and 32019 (rows flagged
+`rival_censored` / `ours_censored`).
+
+Consequences, in order of how much they change the plan:
+
+- **"옥자대부 = 140ms" is not a latency from the open.** On post 32005 the list rendered
+  empty and 옥자대부 appeared 140ms later, which means on that post it registered ~8s after
+  the open, i.e. it was slow that day. It is not a measurement of its best. Do not quote
+  140ms to the customer, and do not treat it as the bar to beat.
+- **The offset between the open and the body render is not fixed** (32005 rendered before
+  anyone had registered; 32018/32019 rendered after two had), so it cannot be subtracted out.
+- **The anonymous page cannot see the moment registration opens.** No amount of extra poll
+  rate fixes that; it is a property of when ezloan renders the post body.
+- **What IS decisive and already in hand:** the final slot order (DOM order ==
+  registration order, verified on real pixels) says who was first, and our own loop logs
+  its registration to the millisecond. Every summary row now carries `alloc_wall_utc` so
+  the next session can join the two directly. Use that pair, not the anonymous arrival
+  times, to answer "how often do we beat 옥자대부".
+- The sampler still earns its keep for everyone who arrives after the render (the 8s+
+  crowd), for the field composition, and for the win/loss record per post.
+
+The report text printed and uploaded on every post now carries this caveat inline, so the
+number cannot be quoted without it.
+
+### Sample so far (n=3, stated honestly)
+
+```
+32005  slot 585 = absent    544 @ +140ms after the list rendered (bracket 250ms)
+32018  slot 585 = 1         both 585 and 544 already on the list at first render (censored)
+32019  slot 585 = 2         both already on the list at first render (censored)
+```
+
+n=3 posts, of which 2 are left-censored, so the competitor timing distribution is still
+effectively **n=1** and it is the wrong measurement anyway (see above). The head-to-head
+record from the slot order is 1 win / 2 posts here, and 4 wins / 5 posts counting the
+full external-8 run (32015 W, 32016 W, 32017 W, 32018 W, 32019 L). **Do not tell the
+customer anything about 1등 off this.** Let the sampler run; posts arrive every 15-45
+minutes, so a day gives 30-50 rows.

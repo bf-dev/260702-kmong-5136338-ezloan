@@ -300,6 +300,16 @@ def render_report(rows, dist):
     lines.append("measurement error (publish bracket, ms): p50=%s max=%s  "
                  "-- every arrival above carries this" % (b["p50"], b["max"]))
     lines.append("")
+    lines.append("ANCHOR CAVEAT, read before quoting any number above. t=0 is when the")
+    lines.append("banner <ul> first renders in the anonymous page. That is NOT the moment")
+    lines.append("registration opens: ezloan allocates the post id ~17s before the list")
+    lines.append("renders, and registration opens ~9s after allocation, so the list appears")
+    lines.append("~8s into a race that is already running. Anyone who registered in those")
+    lines.append("first ~8s is already on the list the first time we can see it, which is")
+    lines.append("what the left-censored count means. Join alloc_wall_utc in the summary")
+    lines.append("rows against the loop's own [registered] timestamps to place ourselves on")
+    lines.append("the real clock; the anonymous page alone cannot.")
+    lines.append("")
     lines.append("per post (t=ms after the banner list first renders):")
     for row in rows[-25:]:
         arr = " ".join("%s(%s)@%dms" % (a["name"], a["advertiser"], round(a["t"] * 1000))
@@ -523,8 +533,7 @@ class Sampler:
 
         summary = {
             "post": pid,
-            "open_wall_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t0_wall))
-                             + ".%03dZ" % int((t0_wall % 1) * 1000),
+            "open_wall_utc": _iso(t0_wall),
             "publish_bracket_s": bracket,
             "armed_lead_s": armed_lead,
             "banners_at_open": [b[0] for b in state["banners"]],
@@ -536,6 +545,7 @@ class Sampler:
             "final_order": final,
             "slot_ours": (final.index(OURS) + 1) if OURS in final else None,
             "slot_rival": (final.index(RIVAL) + 1) if RIVAL in final else None,
+            "alloc_wall_utc": (_iso(t0_wall - armed_lead) if armed_lead is not None else None),
             "armed_bytes": state.get("armed_bytes"),
             "sampler_host": self.a.host_label,
         }
@@ -600,6 +610,11 @@ class Sampler:
             pid += 1
             time.sleep(0.2)
         return pid
+
+
+def _iso(ts):
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
+            + ".%03dZ" % int((ts % 1) * 1000))
 
 
 # ------------------------------------------------------------------------- files
