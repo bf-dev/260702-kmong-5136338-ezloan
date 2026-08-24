@@ -2209,3 +2209,97 @@ upper bound moved from 32022 to 32041. Next session: re-run
 `slot_audit_combined.jsonl`, and recompute the table above with the same regime cutoffs —
 should not need a new regime letter unless the loop is restarted again or moved off
 external-8.
+
+### 00:55Z (2026-08-24, second overnight re-audit) — regime C is now inside ±15pp: 77.8% (n=36)
+
+Bounded re-run, read-only. Nothing on external-8 or external-2 was touched, no login, no
+write path, no 배너잔여 spent (the only new traffic was 14 anonymous GETs of /rq pages).
+
+**Both background processes alive, same pids, zero restarts since yesterday's check:**
+
+- **Live loop** `unicorn@external-8` pid **1532521** (`python3 -u remote_loop.py`),
+  `lstart Sun Aug 23 13:56:31 KST` == 04:56:31Z, `ELAPSED 19:53:44`, state `Ssl`. Same
+  process as the 04:56Z restart, i.e. **~20h uninterrupted**. Confirmed current from its
+  own log in the gateway DB: `[cycle] #66361 ... 등록=38 frontier=32052 배너잔여=439` at
+  00:50:49Z. Its cwd is `~/ezloan-loop`; there is **no local log file** on external-8 (the
+  loop logs only through bridge.py to the Artifacts API), so read the loop's state with the
+  `IngestedLog` query in `regime_report.py`, do not go looking for a .log on the host.
+- **Sampler** `unicorn@external-2` pid **677182** under flock parent 677178,
+  `lstart Sun Aug 23 15:35:43 KST`, `ELAPSED 18:14:35`. Cron `*/2` watchdog + `@reboot`
+  still installed and never had to fire. `state.json` = `{"next_post": 32052, "updated":
+  "2026-08-24T00:43:41Z"}`, `race_summary.jsonl` grown 24 -> **35 rows**.
+- Neither process died. Nothing to restart.
+
+**Audit extended 32041 -> 32052.** `slot_audit_kr.py 32042 32052` off external-2:
+10 posts readable (32042-32051), **8 slot-1**. 32052 does not exist yet (it is the
+frontier the loop is probing, not a post). Backfill attempt on the three pages that were
+already expired yesterday (32015, 32035, 32039): still `exists=false`, they are gone for
+good; 32035/32039 stay filled from the sampler's real-time capture, 32015 stays excluded
+(the sampler was not yet running for it). No other gap exists in 31960-32052.
+
+**Regime table, recomputed over 93 audited posts** (`regime_report.py`, new, see below):
+
+```
+regime                                          posts        h2h  wins   rate     95% CI          half-width
+A  customer PC, v2.5.5 (Windows, home net)    31960-31984   23     0    0.0%  [ 0.0%, 14.3%]      7.2pp
+B  server run, before the 04:56Z restart      32003-32014    8     1   12.5%  [ 2.2%, 47.1%]     22.4pp
+C  server run on external-8, direct KR egress 32015-32052   36    28   77.8%  [61.9%, 88.3%]     13.2pp
+```
+
+C wins: 32016,32017,32018,32021,32023,32024,32025,32026,32027,32028,32029,32031,32032,
+32033,32034,32036,32038,32039,32040,32041,32042,32043,32044,32045,32048,32049,32050,32051.
+C losses: 32019,32020,32022,32030,32035,32037,32046,32047.
+Fisher exact, C (28/36) vs A+B (1/31): **p = 1.2e-10**.
+
+**±15pp bar: MET.** Half-width is **13.2pp**, inside ±15pp with 1.8pp to spare (the
+threshold is first crossed at n=28 at this rate; we are at n=36). The number that can go
+to the owner is:
+
+> **77.8% head-to-head win rate against 옥자대부, 95% CI [61.9%, 88.3%], N = 36
+> head-to-head posts** (32015-32051, every post where both 585 and 544 are on the banner
+> list), under the current configuration (loop on external-8, direct KR egress).
+
+Caveats that must travel with the number: it is a **~24h-old single-configuration** sample,
+it is a *head-to-head* rate (posts where both of us registered), not "1등 on every post",
+and it will move if the loop is restarted, moved, or 옥자대부 changes their poller.
+
+**배너잔여 drain, recomputed.** The series is **not monotonic** across the full history:
+there are hand top-ups (08-05 95->394, 08-13 93->392, 08-14 342->842), so never anchor a
+rate on the global max. Two honest windows:
+
+```
+current loop run   485 (2026-08-23T01:56:06Z) -> 439 (2026-08-24T00:54:03Z)
+                   46 credits / 22.966h = 2.00/hour  ->  439/2.00/24 = 9.13 days to zero
+since last top-up  842 (2026-08-14T02:59:05Z) -> 439 (2026-08-24T00:54:03Z)
+                   403 credits / 237.916h = 1.69/hour -> 10.80 days to zero
+```
+
+Quote the **current-run 2.00/hour, ~9.1 days** figure: the 10-day window is diluted by the
+period when the loop was on the customer's PC and often not running, so it understates the
+burn of the always-on server loop. Yesterday's 2.02/h over 17.8h holds up at 23h (2.00/h).
+Flag the customer at roughly under 200 remaining (~4 days), i.e. around 2026-08-29.
+
+**New tool: `regime_report.py`** (repo root). One read-only pass that does all of the
+above so the next session does not re-derive it by hand:
+
+```
+python3 regime_report.py \
+  --audit out/260824_full/slot_audit_combined.jsonl \
+  --audit out/<new>/slot_audit_<lo>_<hi>.jsonl \
+  --summary out/<new>/race_summary.jsonl \
+  --write-combined out/<new>/slot_audit_combined.jsonl
+```
+
+It merges audit passes (a readable row beats an `exists=false` row for the same post),
+fills expired pages from the sampler capture, prints the regime table with Wilson 95% CIs
+and half-widths, and prints both drain windows. Regime cutoffs live in `REGIMES` at the top:
+**add a letter only when the loop is restarted or moved**, never re-slice C.
+
+**Data:** `out/260824_full/` — `slot_audit_32042_32052.jsonl` (new pass, uploaded to the
+Artifacts API `ezloan-race-slotaudit`, id 07373563, `matched=true`),
+`slot_audit_combined.jsonl` (93 rows, canonical, this is what the table above was computed
+from), `race_summary.jsonl` / `race_detail.jsonl` (sampler capture, 35 rows).
+
+**Next session:** the number is quotable now, so the next audit is only needed if the owner
+wants a tighter interval or the loop changes. If so: `slot_audit_kr.py <last+1> <frontier>`
+on external-2, then `regime_report.py` with the new file appended to the `--audit` list.
