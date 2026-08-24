@@ -2303,3 +2303,115 @@ from), `race_summary.jsonl` / `race_detail.jsonl` (sampler capture, 35 rows).
 **Next session:** the number is quotable now, so the next audit is only needed if the owner
 wants a tighter interval or the loop changes. If so: `slot_audit_kr.py <last+1> <frontier>`
 on external-2, then `regime_report.py` with the new file appended to the `--audit` list.
+
+---
+
+## 2026-08-24 00:55Z — ACCOUNT HANDED BACK TO THE CUSTOMER. EVERYTHING OF OURS IS STOPPED.
+
+**Read this before you start anything on this project.** The customer came back and asked to
+run their own PC copy again. The ezloan account is single-session, so our side was taken
+fully down and verified down. **Nothing of ours is running against this account any more.**
+Do NOT restart the server run without an explicit new instruction: the customer's own copy
+is presumed live, and a second session is the documented way to break theirs.
+
+### 1) The live loop is stopped (JOB 1)
+
+```
+last cycle       [cycle] #66591  등록=38  frontier=32052  배너잔여=439   at 2026-08-24T00:54:57Z
+SIGTERM          2026-08-24T00:54:59Z   [stop] signal 15 received
+remote loop out  2026-08-24T00:55:02Z   rc=0 after 71912s (19h58m), stop requested
+artifacts row    2026-08-24T00:55:03Z   [server_run_stopped]  (source ezloan-server-v2.6.1)
+```
+
+`python3 server_run.py stop` did the whole thing in 7 seconds. Verified after, not assumed:
+
+- `server_run.py status` -> `running: False`; parent pid 232995 gone; `run.pid` removed.
+- `unicorn@external-8`: pid **1532521 GONE**, `ps | grep remote_loop` == 0 matches, no crontab.
+- SOCKS tunnel dead: no `ssh -N -D` process, **port 1085 closed** on this host.
+- **No cycle row after #66591.** Re-checked the Artifacts API at 01:00Z, 6 minutes past the
+  stop: newest `ezloan-server-v2.6.1` row is still the `server_run_stopped` at 00:55:03Z.
+- Whole-fleet sweep for `ezloan|remote_loop|race_sampl` processes: gateway 0, external-8 0,
+  external-2 0. external-1/3/4/5/6/7 unreachable and never hosted the loop.
+
+The ezloan session is therefore genuinely free: no process of ours holds it, and our stored
+copy of the session cookie was deleted as well (section 3).
+
+### 2) The race sampler is stopped too (JOB 2)
+
+`unicorn@external-2` pid 677182 (flock parent 677178), up 18h19m, was killed. Order matters:
+
+```
+ssh unicorn@external-2 'crontab -l > /tmp/ezloan-sampler-crontab.bak; crontab -r'
+ssh unicorn@external-2 'pkill -f "race_sampl[e]r"'     # bracket trick, see below
+```
+
+The `[e]` bracket is the fix for the trap in the 05:35Z section: a plain
+`pkill -f race_sampler` inside an ssh remote command matches the remote shell's own command
+line and kills its own session (exit 255) before the rest of the line runs. Writing the
+pattern as `race_sampl[e]r` makes the literal command line not match the regex.
+
+Verified after: pids 677178 and 677182 both **GONE**, `ps | grep race_sampl` == 0, and
+`crontab -l` -> `no crontab for unicorn` (both the `*/2` watchdog and the `@reboot` line are
+gone, so it will not come back on a reboot). Backup of the removed crontab is at
+`/tmp/ezloan-sampler-crontab.bak` on external-2; the same two lines are quoted in the 05:35Z
+section if you ever need to reinstate them.
+
+**The gateway-side `race_join.py` cron was removed too** (`*/5` on bfdev@main). With both
+collectors down it had nothing left to join, and an indefinitely-running cron against the
+customer's data is the same orphan class. Backup of this host's full crontab before the
+edit: `~/workspace/kmong/tmp/gateway-crontab-260824.bak` (tmp is pruned in 14 days; the two
+removed lines are quoted verbatim in the 07:55Z section).
+
+**Nothing was lost by stopping.** Checked before the kill:
+- The sampler uploads after every completed post. Last completed post **32051** uploaded at
+  00:43:42Z, `matched=True`. Post 32052 was still in `waiting for the banner list to render`
+  and had collected zero rows, so there was no in-flight sample to lose.
+- Everything on both hosts was pulled back into the repo first:
+  `out/260824_handover/sampler/` (full `~/ezloan-sampler` incl. `pages/`, 2.8M) and
+  `out/260824_handover/race-join/` (`joined.jsonl` 35 rows, `report.txt`, `slot_audit.jsonl`
+  63 rows, `state.json`). `out/` is gitignored, so this copy lives on disk only.
+- And a consolidated ZIP was posted to the Artifacts API so it survives either host dying:
+  source **`ezloan-race-handover`**, id `1efc6063-23a8-4f0d-910f-0de6f99cd655`,
+  `matched=true`, 2026-08-24T00:57:10Z.
+
+### 3) Credential hygiene (JOB 3) — what was on disk, and what is left
+
+**No plaintext id or password exists anywhere.** Verified structurally, not assumed:
+`Login Data` / `Login Data For Account` in all five Chrome profiles held **0 saved
+credential rows**; `run.log` (4.8MB, 75k lines) has **0** matches for password /
+`EZLOAN_NAVER`; `~/.bash_history` on the gateway and on both external hosts have 0 matches.
+The env-var -> pipe -> daemon-with-vars-stripped design held.
+
+What the old note got wrong: it said the only thing on disk was `session.json`. There were
+**five more** stores holding reusable sessions, four of them Chrome profile cookie DBs.
+
+| location | held | action |
+|---|---|---|
+| `~/.ezloan-server/5136338/session.json` (0600) | ezloan `ezloan_sess` + csrf, 11 cookies | **deleted** |
+| `~/.ezloan-server/5136338/chrome-profile/` | **Naver `NID_AUT` + `NID_SES`** + ezloan sess | **deleted** |
+| `~/.ezloan-server/5136338/chrome-probe{,2,3}/` | ezloan sess (no NID_AUT) | **deleted** |
+| `~/.ezloan_bot/profile/` (2026-07-02, dev) | **Naver `NID_AUT` + `NID_SES`** + ezloan sess | **deleted** |
+| `unicorn@external-8:~/ezloan-loop/~/ezloan-loop/state/session.json` (0664) | ezloan sess | **deleted** |
+
+The two `NID_AUT`/`NID_SES` pairs are the ones that mattered: those are a live login to the
+customer's **personal Naver account**, not just to ezloan, and one of them was sitting in a
+0664-world-readable path on a shared worker host. Removing them was the right call on a
+handback, and it also guarantees the "no lingering session of ours" property in section 1.
+
+Kept on purpose: `run.log`, `state.json`, `seen-posts.json` (evidence, no credentials in
+them) and `~/.ezloan_bot/chrome/` (the 413MB Chrome-for-Testing download, not a credential).
+Also removed: `loop.lock` and `__pycache__` on external-8. The `ezloan-loop` source files on
+external-8 are left in place; they contain no secrets.
+
+**Cost of the deletion, so you are not surprised:** a future restart can no longer resume
+from the saved cookie, so it needs a full Naver login through the KR egress (~15s becomes
+~1-2 min plus captcha risk). That path is proven, not theoretical: real Naver logins
+succeeded twice on 2026-08-23 (`[login] ezloan session acquired (11 cookies)` at 01:56:04Z
+and 04:00:03Z). Do not treat a missing `session.json` as a fault.
+
+### What is deliberately untouched
+
+The repo, this file's earlier sections, the hosted v2.6.2 exe at
+`https://works.insu.ng/works/public/5136338/ezloan-desktop-update.exe`, and the customer's
+account state (배너잔여 439, 등록 38 for this run) are all unchanged. No registration was
+attempted in this session.
