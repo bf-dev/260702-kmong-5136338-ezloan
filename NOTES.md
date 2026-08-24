@@ -2415,3 +2415,14 @@ The repo, this file's earlier sections, the hosted v2.6.2 exe at
 `https://works.insu.ng/works/public/5136338/ezloan-desktop-update.exe`, and the customer's
 account state (배너잔여 439, 등록 38 for this run) are all unchanged. No registration was
 attempted in this session.
+
+### One thing you will see in the next turn and should not panic about
+
+Committing this file pushes to `main`, which triggers the Actions build, whose GUI
+self-test really does construct the App and really does upload to the Artifacts API. So
+`app_started` / `auto_update_disabled` rows appear minutes after a docs-only commit
+(run 32678525955, 01:02:43Z, is this handover commit). They arrive under source
+**`ezloan-ci-selftest`**, never under `ezloan-desktop-v*`, and the workflow references **no
+secrets at all**, so CI cannot and does not log into Naver or ezloan. It is not a second
+session on the customer's account. This exact confusion cost a real investigation on
+2026-08-23, which is why the source is pinned in `build.yml`.
