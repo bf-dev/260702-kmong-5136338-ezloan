@@ -2426,3 +2426,21 @@ self-test really does construct the App and really does upload to the Artifacts 
 secrets at all**, so CI cannot and does not log into Naver or ezloan. It is not a second
 session on the customer's account. This exact confusion cost a real investigation on
 2026-08-23, which is why the source is pinned in `build.yml`.
+
+## 2026-09-25 status (interim, investigation in progress)
+
+- Customer copy (ezloan-desktop-v2.6.2) went silent after `[cycle] #278851` at 07:01:50Z
+  (등록=177, 배너잔여=298, frontier=33496). No stop/error row: consistent with PC sleep,
+  window close (app.close() posts nothing), kill, or network loss. Customer reported
+  "이지론이 꺼져서요" at 10:43Z.
+- ezloan.io/rq plain GET at 10:44Z: 200 from external-8, external-1, and main. Not a site outage.
+- IngestedLog retention is 7 days for consumed rows (INGEST_LOG_RETENTION_DAYS, gateway
+  index.ts purgeConsumedIngestedLogsBefore). Older evidence only survives in "AgentRun".prompt
+  pending_logs snapshots.
+- 09-17 08:31-10:43Z gap: no uploads at all while the in-app restart's Chrome reached ezloan,
+  but Python requests in the same process got UNKNOWN ("사이트 응답 없음"). Only a full process
+  restart fixed it. Reading: a process-level networking wedge, not a site outage. 2.6.3 fix
+  (escalating recovery: fresh session, then self-restart) is NOT written yet.
+- Server run on external-8: NOT started. Nothing ezloan-related is running there
+  (`~/ezloan-loop` still holds the 2.6.2 files from 2026-08-23). `server_run.py status` on main:
+  running False. No login attempted.
