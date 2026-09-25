@@ -2441,6 +2441,50 @@ session on the customer's account. This exact confusion cost a real investigatio
   but Python requests in the same process got UNKNOWN ("사이트 응답 없음"). Only a full process
   restart fixed it. Reading: a process-level networking wedge, not a site outage. 2.6.3 fix
   (escalating recovery: fresh session, then self-restart) is NOT written yet.
-- Server run on external-8: NOT started. Nothing ezloan-related is running there
-  (`~/ezloan-loop` still holds the 2.6.2 files from 2026-08-23). `server_run.py status` on main:
-  running False. No login attempted.
+- (superseded 11:17Z, see below) Server run on external-8 was not started at the time of this entry.
+
+## 2026-09-25 11:17Z: SERVER RUN IS LIVE (paid order 7635345)
+
+The customer paid (order 7635345, 20,000 won) and sent their Naver login in the Kmong chat
+(message f58282d7-c705-4e43-9642-49faddd4b5fa, `Message` table). The credentials are read
+from that row at start time and handed to `server_run.py start` by env only; they are never
+written to a file, log, or commit (run.log redacts them).
+
+- Daemon on bfdev@main (`~/.ezloan-server/5136338/`), login through the external-8 tunnel,
+  hot loop on unicorn@external-8 (pinned egress 49.247.139.101), `--loop-tick 0.15`, window
+  default 2. Source `ezloan-server-v2.6.2` (server_run.py now derives it from config.APP_VERSION
+  instead of the hardcoded v2.6.1).
+- First [cycle] row at 11:18:13Z; 10 backlog posts registered in the first 3s; 배너잔여 298 -> 290.
+- Status: `python3 server_run.py status`. Rows:
+  `select "createdAt", left(text,160) from "IngestedLog" where "customerKey"='5136338' and source like 'ezloan-server-%' order by "createdAt" desc limit 5`
+- **STOP:** `python3 /home/bfdev/workspace/kmong/projects/260702-kmong-5136338-ezloan/server_run.py stop`
+  (also disarms the watchdog). The customer's PC copy must stay closed while this runs.
+
+### Login lessons from this start
+- Attempt 1 (11:12Z): captcha (receipt image, "구매한 복숭아의 전체 이름은 [?] 복숭아", answer 천도)
+  via the owner bridge. The answer took ~2 min; after resubmit Naver showed a plain
+  `<div class="form_message">다시 로그인해 주세요.</div>` (NOT `.error`) with pw cleared. The old
+  `_outcome_loop` did not recognise it and would have idled 15 min. Fixed: naver_login.py now
+  refills and resubmits up to 2 times on that message. Attempt 2 (11:17Z): no captcha, login in 8s.
+- Answer captchas FAST (seconds, not minutes): the Naver form key expires. The image lands in
+  `~/neoworks/apps/gateway/artifacts/private/d3b89a47-f8bc-45d0-b6fa-03e50f1dfded/*captcha-<token>.png`;
+  answer file procedure is in "If Naver shows a captcha" above; delete it after consumption.
+- To inspect the headless login read-only: the Chrome profile has
+  `~/.ezloan-server/5136338/chrome-profile/DevToolsActivePort`; `curl 127.0.0.1:<port>/json/list`
+  and a CDP `Runtime.evaluate` of `document.body.innerText` shows the exact screen.
+- New: `NaverLogin(on_verification=cb)`. On a 2-step / protection / 본인확인 screen the server run
+  logs the exact screen text, posts `server_login_verification_required`, writes STOP and exits
+  (no retry). The desktop GUI does not pass the callback, so its behaviour is unchanged.
+
+### Restart survival (watchdog)
+- `scripts/server-watchdog.sh`, cron on bfdev@main: `*/2 * * * *` plus `@reboot sleep 90`.
+- Acts only when `~/.ezloan-server/5136338/AUTORESTART` exists (written after a session is
+  acquired), no STOP file, session.json exists, and run.pid is dead. It kills any orphan
+  remote loop on external-8, then runs `server_run.py start --resume ...` with the same
+  args (saved session only, NO credentials). If the session is dead the resumed run has no
+  creds, logs `server_login_no_creds`, removes AUTORESTART and exits: a fresh credentialed
+  start is then needed.
+- It also stands down (and disarms) if any `ezloan-desktop-*` row arrived in the last 10 min,
+  i.e. the customer reopened their own copy.
+- Disarmed by: `server_run.py stop`, a verification screen, an egress violation, no creds.
+- Log: `~/.ezloan-server/5136338/watchdog.log`. To retire it entirely remove the two cron lines.

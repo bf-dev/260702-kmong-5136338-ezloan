@@ -41,11 +41,20 @@ class LoginTemporarilyUnavailable(Exception):
 
 
 class NaverLogin:
-    def __init__(self, driver, log=print, captcha_callback=None, should_stop=None):
+    # Screens that need the account owner (2-step approval, protection lock, identity check).
+    # Only acted on when on_verification is set (server runs); the desktop keeps waiting so
+    # the customer can approve on their phone while the window is open.
+    VERIFY_MARKERS = ("2단계 인증", "2단계인증", "보호조치", "보호하고 있습니다", "본인확인",
+                      "본인 확인", "인증 알림", "인증요청", "인증 요청", "새로운 기기",
+                      "idSafetyRelease", "deviceConfirm")
+
+    def __init__(self, driver, log=print, captcha_callback=None, should_stop=None,
+                 on_verification=None):
         self.d = driver
         self.log = log
         self.captcha_callback = captcha_callback
         self.should_stop = should_stop or (lambda: False)
+        self.on_verification = on_verification
 
     # ---- public ----------------------------------------------------------
     # 로그인 페이지(이지론 로그인 폼 / 네이버 로그인 폼)가 순간적으로 느려
@@ -366,6 +375,7 @@ class NaverLogin:
     def _outcome_loop(self, naver_id, naver_pw):
         deadline = time.time() + 900
         captcha_tries = 0
+        relogin_tries = 0
         while time.time() < deadline:
             if self.should_stop():
                 self.log("중지 요청으로 로그인 중단")
@@ -409,6 +419,28 @@ class NaverLogin:
                 continue
 
             # 로그인 에러
+            # Owner-only verification screen: report the exact text and stop (server runs).
+            if self.on_verification is not None and "naver.com" in url:
+                body = self._safe(lambda: self.d.find_element(By.TAG_NAME, "body").text) or ""
+                hit = [m for m in self.VERIFY_MARKERS if m in body or m in url]
+                if hit:
+                    self._safe(lambda: self.on_verification(url, body, hit))
+                    return False
+
+            # 2026-09-25 live: a captcha answered ~2 min later came back as a plain
+            # <div class="form_message">다시 로그인해 주세요.</div> (not .error) with the pw
+            # field cleared. The form key had expired; a human just logs in again.
+            if "naver.com" in url and self._visible_text(".form_message", "다시 로그인"):
+                if relogin_tries >= 2:
+                    self.log("네이버가 계속 '다시 로그인해 주세요'를 표시 - 중단")
+                    return False
+                relogin_tries += 1
+                self.log(f"네이버 '다시 로그인해 주세요' - 재입력 후 재제출({relogin_tries}/2)")
+                self._refill_credentials(naver_id, naver_pw)
+                self._click_login()
+                time.sleep(3)
+                continue
+
             err = self._error_message()
             if err:
                 self.log(f"네이버 로그인 실패: {err}")
@@ -489,6 +521,15 @@ class NaverLogin:
             time.sleep(1.0)
         except Exception:
             pass
+
+    def _visible_text(self, css, needle):
+        els = self._safe(lambda: self.d.find_elements(By.CSS_SELECTOR, css)) or []
+        for el in els:
+            if self._safe(lambda el=el: el.is_displayed()):
+                txt = (self._safe(lambda el=el: el.text) or "").strip()
+                if needle in txt:
+                    return txt
+        return ""
 
     def _error_message(self):
         # 2026-08-23 실측: 새 로그인 폼은 오류를 .error_message / #err_common 이 아니라

@@ -73,7 +73,21 @@ DEFAULT_EXPECT_IP = os.getenv("EZLOAN_EGRESS_EXPECT_IP", "13.124.160.237")
 # Env that must be in place BEFORE config is imported (config reads it at import time).
 os.environ.setdefault("EZLOAN_APP_DIR", str(RUN_DIR))
 os.environ.setdefault("EZLOAN_CHROME_PROFILE_DIR", str(RUN_DIR / "chrome-profile"))
-os.environ.setdefault("EZLOAN_REMOTE_SOURCE", "ezloan-server-v2.6.1")
+
+def _app_version():
+    import re
+    try:
+        m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', (HERE / "config.py").read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else "unknown"
+    except Exception:
+        return "unknown"
+
+
+os.environ.setdefault("EZLOAN_REMOTE_SOURCE", f"ezloan-server-v{_app_version()}")
+# Present only while a live run holds a working session. scripts/server-watchdog.sh restarts
+# the run (session-resume only, no credentials) after a crash or host reboot while it exists.
+# Removed by `stop`, by a verification screen, and by an egress violation.
+AUTORESTART_FILE = RUN_DIR / "AUTORESTART"
 
 
 # --------------------------------------------------------------------------- logging
@@ -313,6 +327,7 @@ def _run_child(args, creds):
                                    stop_event=stop_event)
                 return
             fatal["reason"] = f"egress guard: {reason}"
+            AUTORESTART_FILE.unlink(missing_ok=True)
             log(f"[egress] FATAL {reason} -- stopping the run rather than egressing "
                 f"from this host")
             remote("server_egress_violation", f"{reason}. Run stopped.", force=True)
@@ -731,6 +746,8 @@ def _login(args, creds, should_stop, log, remote, expected_ip, forced=False):
 
     if not creds.get("id") or not creds.get("pw"):
         log("[login] no credentials in memory, cannot log in")
+        # A resumed run cannot heal a dead session; stop the watchdog from looping on it.
+        AUTORESTART_FILE.unlink(missing_ok=True)
         remote("server_login_no_creds",
                "forced relogin requested but no credentials are held in memory", force=True)
         return None
@@ -758,8 +775,23 @@ def _login(args, creds, should_stop, log, remote, expected_ip, forced=False):
 
         captcha = OwnerCaptchaBridge(log=log, status=lambda t: log(f"[captcha] {t}"),
                                      timeout=args.captcha_timeout)
+
+        def on_verification(url, body, hit):
+            # Naver wants the account owner (2-step, protection lock, new device). Retrying
+            # from here only deepens the lock, so record the exact screen and stop the run.
+            text = redact(body or "").strip()
+            log(f"[login] VERIFICATION SCREEN (markers {hit}) at {redact(url)}\n"
+                f"----- screen text -----\n{text[:3000]}\n----- end -----")
+            remote("server_login_verification_required",
+                   f"markers={hit} url={url}\n{text[:3000]}", force=True)
+            AUTORESTART_FILE.unlink(missing_ok=True)
+            try:
+                STOP_FILE.write_text("naver verification screen, run stopped\n")
+            except Exception:
+                pass
+
         login = NaverLogin(driver, log=log, captcha_callback=captcha,
-                           should_stop=should_stop)
+                           should_stop=should_stop, on_verification=on_verification)
         try:
             ok = login.login(creds["id"], creds["pw"])
         except LoginTemporarilyUnavailable as e:
@@ -789,6 +821,10 @@ def _login(args, creds, should_stop, log, remote, expected_ip, forced=False):
         except Exception:
             pass
         log(f"[login] ezloan session acquired ({len(cookies)} cookies), registration starts")
+        try:
+            AUTORESTART_FILE.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ\n", time.gmtime()))
+        except Exception:
+            pass
         return cookies
     finally:
         if driver is not None:
@@ -928,7 +964,11 @@ def cmd_start(args):
 
     creds = {"id": os.environ.get("EZLOAN_NAVER_ID", "").strip(),
              "pw": os.environ.get("EZLOAN_NAVER_PW", "")}
-    if not args.dry_run and (not creds["id"] or not creds["pw"]):
+    if getattr(args, "resume", False):
+        if not (RUN_DIR / "session.json").exists():
+            print("--resume: no saved session, a credentialed start is needed")
+            return 2
+    elif not args.dry_run and (not creds["id"] or not creds["pw"]):
         print("EZLOAN_NAVER_ID / EZLOAN_NAVER_PW are required for a live run.\n"
               "  EZLOAN_NAVER_ID='...' EZLOAN_NAVER_PW='...' server_run.py start\n"
               "(or use --dry-run to exercise everything except the login)")
@@ -1010,6 +1050,7 @@ def cmd_start(args):
 def cmd_stop(args):
     pid = read_pid()
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    AUTORESTART_FILE.unlink(missing_ok=True)
     STOP_FILE.write_text(f"stop requested {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
     if not pid_alive(pid):
         STOP_FILE.unlink(missing_ok=True)
@@ -1104,7 +1145,11 @@ def build_parser():
                         help="PROBE_WINDOW on the loop host (0 = leave default)")
         return sp
 
-    common(sub.add_parser("start")).add_argument("--foreground", action="store_true")
+    sp = common(sub.add_parser("start"))
+    sp.add_argument("--foreground", action="store_true")
+    sp.add_argument("--resume", action="store_true",
+                    help="restart from the saved ezloan session without credentials "
+                         "(used by scripts/server-watchdog.sh); exits if the session is dead")
     common(sub.add_parser("_child"))
     common(sub.add_parser("selfcheck")).add_argument(
         "--browser", action="store_true",
