@@ -2488,3 +2488,13 @@ written to a file, log, or commit (run.log redacts them).
   i.e. the customer reopened their own copy.
 - Disarmed by: `server_run.py stop`, a verification screen, an egress violation, no creds.
 - Log: `~/.ezloan-server/5136338/watchdog.log`. To retire it entirely remove the two cron lines.
+
+## 2026-09-26 15:01:39Z: run stopped (paid window ended 15:00Z / 00:00 KST Sun)
+
+- run stopped 2026-09-26T15:01:39Z: `server_run.py stop` rc=0, daemon pid 2237083 gone, `[server_run_stopped]` row 15:01:41Z, `[run_stopped]` 15:01:42Z.
+- Last cycle row: `[cycle] #9966 ... 등록=8 frontier=33537 배너잔여=257` at 15:01:36Z (source ezloan-server-v2.6.2).
+- Watchdog disarmed: AUTORESTART and run.pid removed by stop. Cron lines left in place (inert without AUTORESTART + session.json).
+- Process checks: main 0 ezloan procs, no :1085 tunnel; unicorn@external-8 0 ezloan procs, no crontab entry; unicorn@external-1 (reachable again, hostname says external-3) 0 ezloan procs, no crontab entry. The only external-1 lines in run.log are from 2026-08-23, not this run.
+- The :1080 autossh to external-8 on main is the shared Kmong-egress PM2 tunnel, NOT ezloan. Leave it.
+- Session stores removed (same as the 08-24 handback): `~/.ezloan-server/5136338/session.json`, `chrome-profile/` (held Naver NID_AUT/NID_SES), external-8 `~/ezloan-loop/~/ezloan-loop/state/session.json`, `loop.lock`, `__pycache__`. A future server run needs a fresh credentialed Naver login.
+- The customer runs their own desktop copy from Sunday.
