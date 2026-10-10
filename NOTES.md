@@ -2561,3 +2561,17 @@ records per post: `alloc_marks`, `live262_after_alloc_s`, `full_after_alloc_s`, 
 Follow-up if alloc pages lack the markers: widen post_live to "len>=1000 and data-cache= present and
 no 존재하지 않은" (the skeleton has data-cache, the stub and Cloudflare error pages do not).
 Stop the watcher: `ssh unicorn@external-8 pkill -f gate_watch.py`.
+
+### First live sample from the watcher (post 34152, 2026-10-10 22:22Z)
+```
+alloc 22:22:30.967Z (bracket 0.265s), alloc page 297,540 B, markers ['js-memberConfirmView'] -> 2.6.2 post_live True at alloc
+customer PC [registered] ingested 22:22:33.021Z = alloc + 2.05s (ingest lag ~0.5s incl.)
+banner list rendered alloc + 16.956s, first order 623, 544, 585 (we are 3rd, already at first render)
+```
+So the anonymous page DOES go live at allocation (the post_live widening is not needed), and the
+registration gate opened within ~1.5s of alloc on this post (not the ~8.6s of August). Two rivals
+still beat the customer PC inside that 1.5s. That is a pure millisecond race, exactly what the
+v2.6.3 armed path (U(0,0.1)+1 RTT) is built for. The customer PC also pays its home-line RTT,
+unknown; external-8 numbers are a floor. Built: winbuild 2026-10-11, exe sha256 d76448066d67c31e...,
+hosted https://static.neoworks.us/5136338/ezloan-desktop-fast.exe (version-free) and
+.../ezloan-desktop-2.6.3.exe. Not delivered to the customer yet.
