@@ -12,6 +12,7 @@
 
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -537,7 +538,15 @@ def company_rank(s, pid, company=config.COMPANY_NAME):
     return rank_and_above(s, pid, company)[0]
 
 
-def register(s, pid, company=config.COMPANY_NAME, precheck=None):
+def fire_add(s, pid):
+    """v2.6.3: one bare rq_addbanner write. Returns (status, json, text). Raises on network error."""
+    _sync_csrf_header(s)
+    r = s.get(f"{config.BASE_URL}/api/rq_addbanner/{pid}", timeout=12)
+    add = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    return r.status_code, (add if isinstance(add, dict) else {}), (r.text or "")
+
+
+def register(s, pid, company=config.COMPANY_NAME, precheck=None, readback=True):
     # precheck: (code, data) 를 lookahead 의 probe_state 에서 이미 받아 왔으면 재사용한다.
     # 새 글 경쟁에서 상단(1등)을 잡으려면 rq_addbanner 를 최대한 빨리 쏴야 하므로,
     # 같은 rq_addbanner_check 를 두 번 치지 않는다(핫패스 왕복 1회 절감).
@@ -607,6 +616,9 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
     # 예전엔 0.15s 씩 4번(총 ~0.95s)만 보고 포기해 rank=미확인 이 자주 찍혔다(2026-08-23
     # 서버 실행의 32003/32004 둘 다). 등록 직후 목록에 우리가 반영되기까지 1초 이상 걸릴 때가
     # 있고, 이 읽기는 쓰기가 끝난 뒤라 경쟁과 무관하므로 넉넉히 기다리는 쪽이 항상 이득이다.
+    if not readback:
+        return {"ok": True, "rank": 0, "note": "registered", "status": 200,
+                "msg": add_msg or "success", "amount": check_amount, "above": []}
     rank, above = 0, []
     for delay in RANK_READBACK_DELAYS:
         if delay:
@@ -621,6 +633,15 @@ def register(s, pid, company=config.COMPANY_NAME, precheck=None):
 
 class Registrar:
     """로그인 후 requests 세션으로 등록 루프를 돈다."""
+
+    # v2.6.3 state defaults at class level, so harnesses that build the object with
+    # __new__ (all repro_*.py) still get them. __init__ gives each instance its own dicts.
+    _armed_pid = None
+    _armed_since = 0.0
+    _armed_fires = 0
+    _armed_expired_streak = 0
+    _detect_ts = {}
+    _req = {"live": 0, "check": 0, "add": 0, "list": 0}
 
     def __init__(self, cookies, log=print, remote=None, should_stop=None,
                  seen_path=None, relogin=None, status=None):
@@ -675,6 +696,13 @@ class Registrar:
         self._no_perm_retry_pid = None
         self._no_perm_retry_since = 0.0
         self._no_perm_retry_n = 0
+        # v2.6.3 gate fire state
+        self._armed_pid = None
+        self._armed_since = 0.0
+        self._armed_fires = 0
+        self._armed_expired_streak = 0
+        self._detect_ts = {}
+        self._req = {"live": 0, "check": 0, "add": 0, "list": 0}
         self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
         # post_absent 재시도 추적('체크는 open인데 페이지가 아직 안 뜬' 찰나의 경쟁, pid 는
         # 항상 현재 frontier 이므로 같은 pid 가 연속으로 재확인된다). 같은 pid 가 이 횟수 넘게
@@ -1035,7 +1063,7 @@ class Registrar:
             return None
         return (code, data) if code == 200 else None
 
-    def _scan_frontier(self, frontier, width):
+    def _scan_frontier(self, frontier, width, with_check=True):
         """프런티어 앞 width 개 글번호의 '실존'을 동시에 확인한다(v2.6.0 핫패스).
 
         반환: (live_pids, precheck)
@@ -1049,9 +1077,15 @@ class Registrar:
         확인되는 순간, 이미 손에 든 precheck 를 그대로 재사용해 rq_addbanner 1왕복만
         더 쏘면 등록이 끝난다(감지 -> 발사 = 정확히 1왕복).
         """
+        # v2.6.3: the 47-byte check only rides the 1s heavy tick (session/배너잔여 telemetry). The
+        # fast tick is a single post_live read, so a 0.075s tick costs fewer requests than 2.6.2's
+        # 3 requests per 0.15s, and a detected post goes straight to the write (no check RTT).
         pids = [frontier + i for i in range(max(1, int(width)))]
-        fut_check = self._probe_pool.submit(self._safe_check, frontier)
+        fut_check = self._probe_pool.submit(self._safe_check, frontier) if with_check else None
         futs = [(p, self._probe_pool.submit(post_live, self.probe, str(p))) for p in pids]
+        self._req["live"] += len(pids)
+        if with_check:
+            self._req["check"] += 1
         live = []
         for p, f in futs:
             try:
@@ -1060,10 +1094,13 @@ class Registrar:
                 ok = None
             if ok:
                 live.append(p)
-        try:
-            precheck = fut_check.result(timeout=20)
-        except Exception:
-            precheck = None
+                self._detect_ts.setdefault(str(p), time.time())
+        precheck = None
+        if fut_check is not None:
+            try:
+                precheck = fut_check.result(timeout=20)
+            except Exception:
+                precheck = None
         return live, precheck
 
     def _backoff_seconds(self):
@@ -1214,6 +1251,18 @@ class Registrar:
                 # 글이 뜬 것이 확인된 뒤 정확히 한 번만 나간다.
                 now_ts = tick_started
                 heavy_due = (now_ts - self._last_heavy_tick) >= config.LIST_POLL_SECONDS
+                # v2.6.3 gate fire: a detected post that is not open yet is held "armed" and the
+                # fast tick becomes one rq_addbanner every ARMED_ADD_PERIOD (no page read, no
+                # check). The heavy tick below still runs its full lookahead + list safety net.
+                if (self._armed_pid is not None and not heavy_due
+                        and self._armed_pid not in self.seen):
+                    apid = self._armed_pid
+                    ok_adv = self._handle(apid, fast=True)
+                    if ok_adv and apid.isdigit() and int(apid) >= frontier:
+                        frontier = int(apid) + 1
+                    rem = config.ARMED_ADD_PERIOD - (time.time() - tick_started)
+                    self._wait(rem if rem > 0 else 0.0)
+                    continue
                 if config.LOOKAHEAD > 0:
                     # 매 fast tick 은 좁은 창(PROBE_WINDOW, 기본 2 = frontier 와 그 다음
                     # 번호)만 동시에 찌른다. 실측(고객 5136338 등록 이력)상 실제 글 번호는
@@ -1221,8 +1270,9 @@ class Registrar:
                     # 지연 없이 잡힌다. 창 전체(LOOKAHEAD)는 무거운 tick 에서만 훑어(초당 1회)
                     # 두 개 이상 연속으로 건너뛴 드문 경우까지 커버한다.
                     width = config.LOOKAHEAD if heavy_due else getattr(config, "PROBE_WINDOW", 2)
-                    live_pids, precheck = self._scan_frontier(frontier, width)
-                    self._last_check = precheck
+                    live_pids, precheck = self._scan_frontier(frontier, width, with_check=heavy_due)
+                    if heavy_due:
+                        self._last_check = precheck
                     for pid_i in live_pids:
                         pid = str(pid_i)
                         if pid in self.seen or pid in self._post_absent_giveup:
@@ -1230,7 +1280,7 @@ class Registrar:
                         # 존재가 이미 확인된 글에만 쓰기를 쏜다. frontier 본인이면 같은 tick 에
                         # 병렬로 받아둔 precheck 를 재사용해 rq_addbanner 1왕복만 더 쏜다.
                         registered_ok = self._handle(
-                            pid, precheck=(precheck if pid_i == frontier else None))
+                            pid, precheck=(precheck if pid_i == frontier else None), fast=True)
                         # 실존이 확정된(등록 성공/이미등록/거부-실재) 글이면 프런티어를 그 너머로
                         # 전진시킨다. 아직 안 뜬 번호는 애초에 live_pids 에 없으므로 프런티어가
                         # 유령 번호를 지나칠 일이 없다(폭주 방지가 구조적으로 보장된다).
@@ -1276,6 +1326,7 @@ class Registrar:
                 # (되돌리는 하한은 실제 최신글 바로 다음 번호. 그보다 낮추지 않아 옛 글 재처리 없음.)
                 # 목록은 무거운 tick당 '한 번만' 가져온다(각 ~309KB, 재동기화·안전망 공용).
                 ids = list_post_ids(self.s)
+                self._req["list"] += 1
                 real_max = max((int(x) for x in ids if str(x).isdigit()), default=0)
                 # v2.6.1: 낡은(캐시된) 목록 방어. 2026-08-22 장애 로그 실측:
                 # ezloan.io 원본이 죽자(521) Cloudflare 가 '한참 전에 캐시된 목록 페이지'를
@@ -1333,7 +1384,8 @@ class Registrar:
                     f"#{self._cycle} 목록={len(ids)} 새글={len(new)} "
                     f"누적확인={len(self.seen)} 등록={self._registered_total} "
                     f"세션없음연속={self._session_lost_streak} frontier={frontier} "
-                    f"배너잔여={amt}",
+                    f"배너잔여={amt} req={self._req['live']}/{self._req['check']}/"
+                    f"{self._req['add']}/{self._req['list']}",
                 )
                 for pid in sorted(new, key=int, reverse=True):
                     if pid.isdigit() and int(pid) >= frontier:
@@ -1445,7 +1497,107 @@ class Registrar:
             self._wait(self._fast_sleep(tick_started))
         self.remote("run_stopped", "폴링 루프 중지", force=True)
 
-    def _handle(self, pid, precheck=None):
+    def _armed_fire(self, pid):
+        """v2.6.3: fire rq_addbanner straight away on a post whose page is live.
+
+        Returns a register()-shaped result dict, or None meaning "not open yet, keep armed".
+        Only "no permission"/"404 error" inside ARMED_ADD_SECONDS keep the post armed; anything
+        else, or the window running out, falls back to the classic check-based register() path,
+        so every 2.6.1/2.6.2 guard (post_absent, no-permission 90s wait, add_refused) still
+        decides the outcome.
+        """
+        now = time.time()
+        if self._armed_pid != pid:
+            self._armed_pid, self._armed_since, self._armed_fires = pid, now, 0
+        if now - self._armed_since > config.ARMED_ADD_SECONDS:
+            self._armed_expired_streak += 1
+            self.remote("armed_expired",
+                        f"post={pid} {config.ARMED_ADD_SECONDS:.0f}s 동안 쓰기 {self._armed_fires}회 거부 - "
+                        f"체크 기반 대기로 전환(연속 {self._armed_expired_streak})", force=True)
+            self._armed_pid = None
+            return "fallback"
+        try:
+            self._armed_fires += 1
+            self._req["add"] += 1
+            t0 = time.time()
+            status, add, text = fire_add(self.s, pid)
+            t1 = time.time()
+        except Exception:
+            return None
+        add_msg = (add.get("msg") or "").strip()
+        if status == 200 and add.get("result") is True:
+            self._armed_pid = None
+            self._armed_expired_streak = 0
+            det = self._detect_ts.get(pid)
+            return {"ok": True, "rank": 0, "note": "registered", "status": 200,
+                    "msg": add_msg or "success", "amount": None, "above": [],
+                    "det_ms": int((t1 - det) * 1000) if det else None,
+                    "fire_ms": int((t1 - t0) * 1000), "fires": self._armed_fires,
+                    "armed_s": round(t1 - self._armed_since, 3)}
+        if add_msg.lower() in ("no permission", "404 error"):
+            if self._armed_fires == 1:
+                self.log(f"새 글 {pid} 감지 - 등록 개시 대기, 열리는 즉시 등록 시도")
+                self.remote("armed", f"post={pid} 페이지는 떴고 등록은 아직 안 열림(msg={add_msg}) - "
+                            f"{config.ARMED_ADD_PERIOD}s 마다 바로 등록 시도", force=True)
+            return None
+        self._armed_pid = None
+        return "fallback"
+
+    def _rank_later(self, pid):
+        """Read our slot off the anonymous page in the background (the banner list renders
+        ~8s after the gate, so 2.6.2's inline 8s readback always logged 미확인 and blocked
+        the loop while doing it)."""
+        def _run():
+            try:
+                rank, above = 0, []
+                for delay in (3, 3, 4, 4, 5, 6, 8):
+                    time.sleep(delay)
+                    rank, above = rank_and_above(self.probe, pid)
+                    if rank:
+                        break
+                self.remote("rank", f"post={pid} rank={rank or '미확인'}"
+                            + (f" 위에={','.join(above)}" if above else (" 위에=없음(1등)" if rank else "")),
+                            force=True)
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _handle(self, pid, precheck=None, fast=False):
+        result = None
+        if fast and self._armed_expired_streak < config.ARMED_ADD_MAX_STREAK:
+            r = self._armed_fire(pid)
+            if r is None:
+                return False   # armed: not seen, frontier held, retried next tick
+            if r != "fallback":
+                result = r
+        if result is not None:
+            return self._after_register(pid, result)
+        return self._handle_classic(pid, precheck)
+
+    def _after_register(self, pid, result):
+        self._registered_total += 1
+        self._session_lost_streak = 0
+        self._auth_mismatch_streak = 0
+        self._fresh_refuse_streak = 0
+        self._no_perm_streak = 0
+        self._no_perm_warned = False
+        self._no_perm_retry_pid = None
+        if pid == self._post_absent_pid:
+            self._post_absent_pid = None
+            self._post_absent_streak = 0
+        self.seen.add(pid)
+        self._post_absent_giveup.discard(pid)
+        self._write_seen()
+        self._detect_ts.pop(pid, None)
+        self.log(f"등록 완료: {pid}")
+        self.remote("registered",
+                    f"post={pid} rank=확인중 msg={result.get('msg')} det_to_reg_ms={result.get('det_ms')} "
+                    f"add_rtt_ms={result.get('fire_ms')} fires={result.get('fires')} "
+                    f"armed_s={result.get('armed_s')}", force=True)
+        self._rank_later(pid)
+        return True
+
+    def _handle_classic(self, pid, precheck=None):
         """이 글을 등록 시도한다. 반환값: 이 글이 '실존이 확정'됐는지(bool).
 
         상위 lookahead 루프는 이 반환값으로 프런티어 전진을 결정한다. post_absent(아직 안

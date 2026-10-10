@@ -6,7 +6,7 @@ import os
 # 2.6.2 (2026-08-23): 2.6.1 의 exe 는 네이버 로그인 버튼 셀렉터 수정(0f353c2) 이전에
 # 빌드되어, 새 로그인이 필요한 순간 무조건 TimeoutException 으로 죽는다. 코드 변경 없이
 # '현재 main 을 그대로 빌드'하기 위한 버전 번호다(로그인 수정 + 2.6.1 장애/세션 + 2.6.0 감지).
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 CUSTOMER_ID = "5136338"
 
 # 이지론
@@ -68,14 +68,18 @@ def _env_int(name, default):
         return default
 
 
-FRONTIER_POLL_SECONDS = _env_float("EZLOAN_FRONTIER_POLL_SECONDS", 0.15)
+# v2.6.3 (2026-10-11): 0.15 -> 0.075. The fast tick now sends ONE request (post_live on the
+# frontier; the rq_addbanner_check moved to the 1s heavy tick and PROBE_WINDOW went 2 -> 1),
+# so the steady-state rate DROPS from 3 req/0.15s (20/s) to 1 req/0.075s (13.3/s) while the
+# mean detection wait halves (75ms -> 37ms). Measured live from external-8 (hotpath_bench.py).
+FRONTIER_POLL_SECONDS = _env_float("EZLOAN_FRONTIER_POLL_SECONDS", 0.075)
 # 존재 확인 tick 주기(절대 스케줄) - 새 글 감지 지연 상한.
 # 매 fast tick 에 '동시에' 찔러 볼 글 번호 개수(frontier, frontier+1, ...).
 # 실제 글 번호는 거의 항상 연속이고 아주 가끔 하나를 건너뛰므로(실측: 31222 -> 31224),
 # 창 2면 건너뛴 번호도 지연 없이 잡힌다. 요청은 스레드로 병렬 발사되므로 tick 의 벽시계
 # 비용은 창 크기와 무관하게 1왕복이다. 창 전체(LOOKAHEAD)는 무거운 tick 에서만 훑는다.
 # 창을 1 로 줄여도 건너뛴 번호는 무거운 tick(1초마다, width=LOOKAHEAD=6)이 1초 안에 잡는다.
-PROBE_WINDOW = _env_int("EZLOAN_PROBE_WINDOW", 2)
+PROBE_WINDOW = _env_int("EZLOAN_PROBE_WINDOW", 1)
 # tick 대비 스케일 계수. 아래의 'tick 개수'로 표현된 상수들은 전부 tick 0.15s 기준으로
 # 튜닝된 값이라, tick 을 좁히면 벽시계 기준 방어선이 같이 짧아져 버린다. 이 계수를 곱해
 # 벽시계 타이밍(32s / 4s / 9.75분)을 tick 값과 무관하게 고정한다.
@@ -97,6 +101,18 @@ NO_PERM_WARN_STREAK = 5
 # 전진이라 그 글을 영영 놓쳤다(32005 에 우리 배너 없음, 옥자대부는 개시 +0.14초에 등록).
 # 이 창을 넘겨도 계속 거부되면 그때는 진짜 계정 측 거부로 보고 예전대로 포기한다.
 NO_PERM_RETRY_SECONDS = 90.0
+# v2.6.3 gate fire. Once a post is known to exist but answers "no permission" (allocated, banner
+# registration not open yet; 2026-08 measured ~8.6s), the loop stops re-reading its 300KB page and
+# re-asking the check, and fires rq_addbanner itself every ARMED_ADD_PERIOD for ARMED_ADD_SECONDS.
+# The first write after the gate opens IS the registration: gate -> write = U(0, 0.1s) + 1 RTT
+# instead of U(0, 0.15s) + check RTT + write RTT. A refused write spends no 배너잔여.
+# Bound: <= ARMED_ADD_SECONDS / ARMED_ADD_PERIOD = 200 refused writes per post, and once
+# ARMED_ADD_MAX_STREAK posts in a row were given up (account-side refusal, not a gate), it falls
+# back to the 47-byte check every ARMED_CHECK_PERIOD so a refusing account is not hammered.
+ARMED_ADD_PERIOD = 0.1
+ARMED_ADD_SECONDS = 20.0
+ARMED_CHECK_PERIOD = 0.5
+ARMED_ADD_MAX_STREAK = 2
 # post_absent(체크는 통과했으나 글 페이지가 아직 안 뜬 상태)를 같은 글번호로 이 사이클 수
 # 만큼 연속으로 겪으면 그제서야 '진짜 없는 번호'로 보고 포기(seen 처리)한다. 2026-07-27
 # 실측(고객 5136338)의 정상적인 페이지-반영 지연은 길어야 수 초~수십 초였고, 이 상한은

@@ -2,10 +2,17 @@
 """진입점. 빌드/실행 공통."""
 
 import os
+import sys
 import threading
 import tkinter as tk
 
+# Our screenshot mode (winbuild). Must be set before config is imported so the
+# app_started row is tagged as CI, never as the customer's PC.
+if "--guidemo" in sys.argv:
+    os.environ.setdefault("EZLOAN_REMOTE_SOURCE", "ezloan-ci-selftest")
+
 from app import App
+import config
 
 
 def main():
@@ -41,6 +48,24 @@ def main():
         root.after(1500 if screenshot_path else 500, _finish_diagnostic)
         root.mainloop()
         print("selftest ok")
+        return
+
+    if "--guidemo" in sys.argv:
+        # winbuild screenshot: the real window, filled with the status lines a v2.6.3 run
+        # prints, held open long enough for the capture. No login, no ezloan traffic.
+        app.set_status("자동 등록 진행 중")
+        for line in (
+            f"이지론 배너 자동등록 v{config.APP_VERSION} 시작",
+            "로그인 세션 확인 완료",
+            "자동 등록 시작됨",
+            "모니터링 중... (새 글 감지 0.075초 간격)",
+            "새 글 34152 감지 - 등록 개시 대기, 열리는 즉시 등록 시도",
+            "등록 완료: 34152",
+            "모니터링 중... (새 글 감지 0.075초 간격)",
+        ):
+            app.log(line)
+        root.after(75000, root.destroy)
+        root.mainloop()
         return
 
     # 시작 직후 저장된 로그인 세션 복구 시도(자동 업데이트 재시작/재실행 후 재로그인 방지).

@@ -95,6 +95,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_no_permission_not_open_yet.py
 
+      - name: v2.6.3 gate-fire armed path
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_gate_fire_armed.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8

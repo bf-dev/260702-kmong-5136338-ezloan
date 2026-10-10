@@ -25,6 +25,8 @@ EXISTING = set(range(1, REAL_MAX + 1))
 FAKE_NOW = [0.0]
 LIST_CALL_TIMES = []
 CHECK_CALL_TIMES = []
+PROBE_CALL_TIMES = []
+ADD_CALL_TIMES = []   # v2.6.3: the fast tick is the 353-byte /rq/{id} read, not the check
 # heavy tick 두 번 사이(중간)에 새 글이 생기게 한다 - 안전망(무거운 tick)이 아니라 fast tick
 # 이 이 글을 잡아야만 통과하는 배치.
 NEW_POST_APPEARS_AT = config.LIST_POLL_SECONDS * 1.5
@@ -88,6 +90,7 @@ class FakeSession:
             links = "".join(f'<a href="/rq/{i}">글</a>' for i in ids)
             return FakeResp(200, text="로그아웃 광고 관리 " + links)
         if "/rq/" in url and "/api/" not in url:
+            PROBE_CALL_TIMES.append(FAKE_NOW[0])
             pid = int(url.rsplit("/", 1)[-1])
             live_page = "배너 rq_addbanner js-memberConfirmView " + ("x" * 260000)
             r = FakeResp(200, text=live_page if _page_is_live(pid) else ("y" * 353))
@@ -98,6 +101,7 @@ class FakeSession:
             return FakeResp(200, js={"result": True, "amount": 186})
         if "/api/rq_addbanner/" in url:
             pid = int(url.rsplit("/", 1)[-1])
+            ADD_CALL_TIMES.append((FAKE_NOW[0], pid))
             if _page_is_live(pid):
                 return FakeResp(200, js={"result": True})
             return FakeResp(200, js={"result": False, "msg": "404 error"})
@@ -190,21 +194,26 @@ def main():
     print(f"[OK] 무거운 /rq fetch {len(LIST_CALL_TIMES)}회, 전부 정확히 LIST_POLL_SECONDS"
           f"({config.LIST_POLL_SECONDS}s) 간격으로만 발생(fast tick 마다가 아님).")
 
-    # --- 검증 2: 가벼운 체크는 heavy tick 보다 훨씬 자주(매 fast tick) 일어난다 ---
-    assert len(CHECK_CALL_TIMES) > len(LIST_CALL_TIMES) * 2, (
-        f"가벼운 체크가 heavy tick 만큼만 일어남(분리 실패): check={len(CHECK_CALL_TIMES)} "
+    # --- 검증 2: 가벼운 존재 확인은 heavy tick 보다 훨씬 자주(매 fast tick) 일어난다 ---
+    # v2.6.3: the light per-tick probe is the anonymous /rq/{id} read; rq_addbanner_check
+    # rides the heavy tick only (one per LIST_POLL_SECONDS), which is what cut the request rate.
+    assert len(PROBE_CALL_TIMES) > len(LIST_CALL_TIMES) * 2, (
+        f"가벼운 존재 확인이 heavy tick 만큼만 일어남(분리 실패): probe={len(PROBE_CALL_TIMES)} "
         f"list={len(LIST_CALL_TIMES)}")
-    print(f"[OK] 가벼운 rq_addbanner_check {len(CHECK_CALL_TIMES)}회 - heavy tick"
-          f"({len(LIST_CALL_TIMES)}회)보다 훨씬 자주 돎(fast tick 분리 확인).")
+    assert len(CHECK_CALL_TIMES) <= len(LIST_CALL_TIMES) + 1, (
+        f"v2.6.3: check 는 heavy tick 에만 실려야 함: check={len(CHECK_CALL_TIMES)} list={len(LIST_CALL_TIMES)}")
+    print(f"[OK] 가벼운 /rq/{{id}} 존재 확인 {len(PROBE_CALL_TIMES)}회 - heavy tick"
+          f"({len(LIST_CALL_TIMES)}회)보다 훨씬 자주 돎, check 는 {len(CHECK_CALL_TIMES)}회(heavy tick 전용).")
 
     # --- 검증 3: 새 글은 그 다음 heavy tick 을 기다리지 않고 바로 등록된다 ---
     assert str(NEW_PID) in r.seen, f"새 글이 등록되지 않음: seen={r.seen}"
     # 등록이 실제로 일어난(=register 성공) 시각을 CHECK_CALL_TIMES 로는 알 수 없으니,
     # NEW_PID 에 대한 rq_addbanner_check 호출들 중 '생성 시각 이후 첫 호출' 시각으로 근사한다.
     # (매 fast tick 마다 lookahead 가 frontier=NEW_PID 를 찔러보므로, 이 시각이 곧 감지+등록 시각.)
+    # v2.6.3: the register moment is the first rq_addbanner on NEW_PID after it appears.
     detect_time = None
-    for t in CHECK_CALL_TIMES:
-        if t >= NEW_POST_APPEARS_AT:
+    for t, p in ADD_CALL_TIMES:
+        if p == NEW_PID and t >= NEW_POST_APPEARS_AT:
             detect_time = t
             break
     assert detect_time is not None, "생성 이후 체크 호출을 찾지 못함"

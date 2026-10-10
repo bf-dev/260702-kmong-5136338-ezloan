@@ -1,0 +1,6 @@
+{
+  "name": "이지론배너자동등록",
+  "entry": "main.py",
+  "pyinstaller": ["--onefile", "--noconsole", "--collect-all", "selenium"],
+  "screenshot": { "args": ["--guidemo"], "wait": 20 }
+}

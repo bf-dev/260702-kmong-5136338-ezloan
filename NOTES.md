@@ -2498,3 +2498,66 @@ written to a file, log, or commit (run.log redacts them).
 - The :1080 autossh to external-8 on main is the shared Kmong-egress PM2 tunnel, NOT ezloan. Leave it.
 - Session stores removed (same as the 08-24 handback): `~/.ezloan-server/5136338/session.json`, `chrome-profile/` (held Naver NID_AUT/NID_SES), external-8 `~/ezloan-loop/~/ezloan-loop/state/session.json`, `loop.lock`, `__pycache__`. A future server run needs a fresh credentialed Naver login.
 - The customer runs their own desktop copy from Sunday.
+
+## 2026-10-11: v2.6.3 (paid order 7664141, slot 1 target, slot 2 minimum)
+
+### Which build the customer actually runs (read this first)
+- The customer's `ezloan-desktop-v2.6.2` is the exe from commit **c3407cb** (2026-08-23 03:01).
+  The pre-open fix `fe0ab2b` (no_permission = not open yet, 90s wait) and the rank parser fix
+  `35caee9` came AFTER that build and were never shipped to the PC. So on the customer PC a
+  fresh post's "no permission" is still NON_RETRYABLE (seen + skip).
+- The hosted `ezloan-desktop-update.exe` is still the 2.5.5 bytes (07-28), not 2.6.2.
+- Telemetry 10-03..10-11: 314 `[registered]`, every one `rank=미확인` (the inline 8s readback
+  ends before the banner list renders ~17s after alloc). Live DOM scan 10-10: slot 3 on 52/57,
+  behind 623 BBG론 and 544 옥자대부.
+
+### Where the time goes (measured 2026-10-11 from external-8, warm keep-alive, read-only)
+```
+DNS 1.0ms  TCP 2.0ms  TLS 19.3ms  cold GET /rq/{miss} p50 94ms   (latency_legs.py)
+warm /rq/{miss} 54.7  rq_addbanner_check(anon) 45.5  rq_addbanner(anon, refused) 46.8 ms p50
+/rq/{live} TTFB 80.7, total 85.1 ms (39KB gzip)   /rq/{miss} 53.0 ms (185 B)   (ttfb.py)
+keep-alive: survives 400 req and 20s idle; dropped after 70s idle (ka.py)
+```
+detect -> rq_addbanner response, live ezloan.io, anonymous refused write as the register stub
+(`hotpath_bench.py <live_id> 40`, includes the simulated tick wait):
+```
+v2.6.2 open-at-detect  (U(0,.15) + parallel[live x2, check] + add)  p50 217.5  p90 273.9 ms
+v2.6.3 open-at-detect  (U(0,.075) + live + add)                     p50 169.3  p90 194.7 ms
+pre-2.6.3 pre-open     (U(0,.15) + check + add)                     p50 163.8  p90 204.4 ms
+v2.6.3 pre-open armed  (U(0,.1) + add)                              p50  92.4  p90 139.9 ms
+```
+The parallel scan in 2.6.2 waits for the SLOWEST of three requests, one of them a 300KB live page.
+
+### What changed in v2.6.3 (ezloan_bot.py, config.py)
+1. Fast tick 0.15 -> 0.075s, PROBE_WINDOW 2 -> 1, and `rq_addbanner_check` moved to the 1s heavy
+   tick only. Fast tick = one 185-byte read.
+2. Gate fire: a post whose page is live is fired at once with `rq_addbanner` (no check first).
+   If it answers "no permission"/"404 error" the post is held armed and the write is re-fired every
+   `ARMED_ADD_PERIOD`=0.1s for at most `ARMED_ADD_SECONDS`=20s (<= 200 refused writes per post), then
+   the classic 2.6.2 path takes over (90s check wait, post_absent guard, add_refused). After
+   `ARMED_ADD_MAX_STREAK`=2 consecutive armed expiries the write-polling turns itself off.
+3. The rank readback moved off the loop thread (`_rank_later`, background, up to ~33s) and logs a
+   separate `[rank] post=N rank=K 위에=...` row. `[registered]` now carries
+   `det_to_reg_ms`, `add_rtt_ms`, `fires`, `armed_s`. `[cycle]` carries `req=live/check/add/list`.
+4. `main.py --guidemo` (winbuild screenshot, posts as ezloan-ci-selftest), `winbuild.json`.
+Guards kept and re-run: all 13 CI gates pass, plus new `repro_gate_fire_armed.py`.
+`repro_frontier_fast_tick.py` was updated: its probe counter now counts the /rq/{id} read.
+
+### Request rate (steady state, per second)
+```
+v2.6.2: 5.67 fast ticks x 3 req + 1 heavy x 8 req = ~25 req/s (2 of them 300KB-capable page reads per tick)
+v2.6.3: 12.33 fast ticks x 1 req + 1 heavy x 8 req = ~20.3 req/s  (-19%)
+armed window (~8.6s per post): 2.6.2 HEAD design 20 req/s of page+check reads;
+2.6.3 10 refused writes/s + heavy = ~18 req/s. Writes per post: 1 -> ~87 (cap 200), i.e. 2.6k-5k
+refused writes/day at 30-60 posts/day, below the 15k/day that v2.4.6-v2.5.5 ran for weeks.
+```
+
+### Open question the watcher answers
+Does the anonymous page go "live" at id allocation (skeleton with `js-memberConfirmView`, seen on
+32035 in August) or only when the banner list renders ~17s later? If only at render, the PC was
+registering ~8s after the gate and that alone explains slot 3. `gate_watch.py` (running on
+unicorn@external-8 since 2026-10-11 06:40 KST, `~/ezl263/gate.jsonl`, log `~/ezl263/gate.log`)
+records per post: `alloc_marks`, `live262_after_alloc_s`, `full_after_alloc_s`, first banner order.
+Follow-up if alloc pages lack the markers: widen post_live to "len>=1000 and data-cache= present and
+no 존재하지 않은" (the skeleton has data-cache, the stub and Cloudflare error pages do not).
+Stop the watcher: `ssh unicorn@external-8 pkill -f gate_watch.py`.
