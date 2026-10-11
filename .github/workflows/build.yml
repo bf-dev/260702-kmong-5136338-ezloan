@@ -100,6 +100,11 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python repro_gate_fire_armed.py
 
+      - name: v2.6.4 no-amount status line
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python repro_no_amount_status.py
+
       - name: Verify login resilience (TimeoutException retries, no crash)
         env:
           PYTHONIOENCODING: utf-8

@@ -107,6 +107,11 @@ NON_RETRYABLE = {"slots_full", "no_banner_amount", "no_ads", "no_payed_ads",
 # 올라 거짓 session_expired('재로그인 필요')/auth_mismatch backoff 에 갇힌다.
 # 진짜 세션 사망 여부는 항상 logged_in()==False 로만 판정한다.
 SESSION_LOST_MSGS = {"no session", "session expired", "unauthorized", "logout", "please login"}
+# v2.6.4: shown in the status line and log box while the register API answers "no amount"
+# (no_banner_amount, account balance 0). Cleared on the next successful registration.
+NO_AMOUNT_STATUS = "배너 잔여가 없습니다. 이지론에서 배너를 충전해 주세요."
+NO_AMOUNT_RELOG_SECONDS = 60
+
 _NOTE_MAP = {
     # 로그인은 유효하나 이 글/계정이 지금 등록 대상이 아님(세션소실 아님). 재시도 없이 넘긴다.
     "no permission": "no_permission",
@@ -642,6 +647,8 @@ class Registrar:
     _armed_expired_streak = 0
     _detect_ts = {}
     _req = {"live": 0, "check": 0, "add": 0, "list": 0}
+    _no_amount = False
+    _no_amount_logged = 0.0
 
     def __init__(self, cookies, log=print, remote=None, should_stop=None,
                  seen_path=None, relogin=None, status=None):
@@ -703,6 +710,9 @@ class Registrar:
         self._armed_expired_streak = 0
         self._detect_ts = {}
         self._req = {"live": 0, "check": 0, "add": 0, "list": 0}
+        # v2.6.4: True while the last register answer was no_banner_amount (balance 0).
+        self._no_amount = False
+        self._no_amount_logged = 0.0
         self._relogin_done = False   # 강제 재로그인은 실행당 1회만(무한 루프 방지)
         # post_absent 재시도 추적('체크는 open인데 페이지가 아직 안 뜬' 찰나의 경쟁, pid 는
         # 항상 현재 frontier 이므로 같은 pid 가 연속으로 재확인된다). 같은 pid 가 이 횟수 넘게
@@ -1393,7 +1403,7 @@ class Registrar:
                     self._handle(pid)
                     if self.should_stop():
                         break
-                if not new:
+                if not new and not self._no_amount:
                     self.log(f"모니터링 중... ({len(self.seen)}개 확인됨)")
 
                 # 갱신된 세션 쿠키를 주기적으로 디스크에 저장(재시작 복구가 살아있게 유지).
@@ -1589,6 +1599,7 @@ class Registrar:
         self._post_absent_giveup.discard(pid)
         self._write_seen()
         self._detect_ts.pop(pid, None)
+        self._clear_no_amount()
         self.log(f"등록 완료: {pid}")
         self.remote("registered",
                     f"post={pid} rank=확인중 msg={result.get('msg')} det_to_reg_ms={result.get('det_ms')} "
@@ -1649,6 +1660,7 @@ class Registrar:
             if pid == self._post_absent_pid:
                 self._post_absent_pid = None
                 self._post_absent_streak = 0
+            self._clear_no_amount()
             self.log(f"등록 완료: {pid} (순위 {result['rank']}위)")
             above = result.get("above") or []
             self.remote("registered",
@@ -1666,6 +1678,7 @@ class Registrar:
             if pid == self._post_absent_pid:
                 self._post_absent_pid = None
                 self._post_absent_streak = 0
+            self._clear_no_amount()
             self.remote("registered", f"post={pid} rank=미확인 note={note} msg={msg}", force=True)
         elif result.get("session_lost"):
             # 인증 실패. 실행당 1회, 요청/응답/쿠키 전체를 진단 API 로 덤프한다.
@@ -1808,6 +1821,8 @@ class Registrar:
         else:
             # 정상적으로 '등록 불가'인 글들(예: max/no ads 등)은 디바운스 로그.
             self.remote("register_skip", f"post={pid} status={status} msg={msg} note={note}")
+            if note == "no_banner_amount":
+                self._set_no_amount(pid)
 
         # 실존 확정 여부(상위 lookahead 의 프런티어 전진 판단용).
         #  - post_absent: 위 elif 분기에서 이미 return 함(재시도 중이면 False, 포기했으면 True).
@@ -1822,6 +1837,25 @@ class Registrar:
                     "slots_full", "no_banner_amount", "no_ads", "no_payed_ads"):
             return True
         return False
+
+    def _set_no_amount(self, pid):
+        """v2.6.4: the register API said "no amount" (배너 잔여 0). Tell the customer in the
+        status line and log box instead of printing 모니터링 중 as if all were fine."""
+        now = time.time()
+        if not self._no_amount:
+            self._no_amount = True
+            self._no_amount_logged = now
+            self.status(NO_AMOUNT_STATUS)   # GUI: status line + log box
+            self.remote("no_amount_shown", f"post={pid} 배너 잔여 없음 안내 표시", force=True)
+        elif now - self._no_amount_logged >= NO_AMOUNT_RELOG_SECONDS:
+            self._no_amount_logged = now
+            self.log(NO_AMOUNT_STATUS)
+
+    def _clear_no_amount(self):
+        if self._no_amount:
+            self._no_amount = False
+            self.status("자동등록 진행 중")
+            self.remote("no_amount_cleared", "등록 성공 - 배너 잔여 없음 안내 해제", force=True)
 
     def _wait(self, seconds):
         end = time.time() + seconds

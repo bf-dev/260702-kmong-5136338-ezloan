@@ -51,19 +51,22 @@ def main():
         return
 
     if "--guidemo" in sys.argv:
-        # winbuild screenshot: the real window, filled with the status lines a v2.6.3 run
-        # prints, held open long enough for the capture. No login, no ezloan traffic.
+        # winbuild screenshot: the real window, filled with the status lines a v2.6.4 run
+        # prints when the register API answers "no amount", held open long enough for the
+        # capture. No login, no ezloan traffic. The status line itself comes from the same
+        # NO_AMOUNT_STATUS constant the Registrar uses.
+        from ezloan_bot import NO_AMOUNT_STATUS
         app.set_status("자동 등록 진행 중")
         for line in (
             f"이지론 배너 자동등록 v{config.APP_VERSION} 시작",
             "로그인 세션 확인 완료",
             "자동 등록 시작됨",
             "모니터링 중... (새 글 감지 0.075초 간격)",
-            "새 글 34152 감지 - 등록 개시 대기, 열리는 즉시 등록 시도",
-            "등록 완료: 34152",
+            "등록 완료: 34167",
             "모니터링 중... (새 글 감지 0.075초 간격)",
         ):
             app.log(line)
+        app.set_status(NO_AMOUNT_STATUS)
         root.after(75000, root.destroy)
         root.mainloop()
         return

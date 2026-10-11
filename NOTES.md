@@ -2575,3 +2575,39 @@ v2.6.3 armed path (U(0,0.1)+1 RTT) is built for. The customer PC also pays its h
 unknown; external-8 numbers are a floor. Built: winbuild 2026-10-11, exe sha256 d76448066d67c31e...,
 hosted https://static.neoworks.us/5136338/ezloan-desktop-fast.exe (version-free) and
 .../ezloan-desktop-2.6.3.exe. Not delivered to the customer yet.
+
+## 2026-10-11: alloc -> registration gap (34156-34167) and v2.6.4 no-amount status
+
+### Gap: watcher alloc time vs customer [registered] ingest time
+Join of `gate.jsonl` (external-8 watcher, alloc = midpoint of the first non-miss GET, bracket
+~0.265s since the previous miss) with IngestedLog `ezloan-desktop-v2.6.3` `[registered]` rows.
+The ingest `createdAt` is server receive time, so gap = PC fire + RTT + remote_log upload
+(~0.1-0.3s), i.e. an upper bound on alloc -> register. Copy of gate.jsonl: `rel/gate.jsonl`
+(gitignored). Watcher stopped 2026-10-11 ~06:00Z (`pkill -f gate_watch.py`, verified no process).
+```
+post   alloc (watcher)          registered (ingest)      gap s   det_to_reg_ms
+34161  03:30:56.671Z            03:30:57.131Z            0.460   166
+34162  03:32:47.646Z            03:32:48.182Z            0.536   181
+34163  (watcher first saw it 03:34:19.628 = 71s late, busy tailing 34162, not usable)   151
+34164  03:39:41.248Z            03:39:41.901Z            0.653    61
+34165  03:44:22.551Z            03:44:22.948Z            0.397    60
+34166  04:02:14.064Z            04:02:14.537Z            0.473    62
+34167  04:06:17.346Z            04:06:18.096Z            0.750   177
+median 34161-34167 (6 covered): 0.505 s.  With 34156-34160 too (10 covered): 0.595 s.
+```
+All 34156-34167 [rank] rows: slot 3 behind 623 + 544. Every post had banners already
+rendered at first full page (~14-21s after alloc), so ordering is fixed inside that first ~0.5s.
+34168-34173: `register_skip ... msg=no amount note=no_banner_amount` (balance 0, last cycle
+배너잔여=6 at 03:30Z then exhausted).
+
+### v2.6.4 (GUI only, hot path unchanged)
+- `ezloan_bot.NO_AMOUNT_STATUS` = 「배너 잔여가 없습니다. 이지론에서 배너를 충전해 주세요.」. On a
+  classic-path `register_skip` with note `no_banner_amount`, `_set_no_amount()` sends it via
+  `status()` (GUI status line + log box), re-logs it at most once per 60s, and suppresses the
+  heavy-tick `모니터링 중... (N개 확인됨)` line. `_clear_no_amount()` runs on every successful
+  registration (armed `_after_register` and both classic success branches) and sets
+  status back to 「자동등록 진행 중」. Remote rows: `[no_amount_shown]`, `[no_amount_cleared]`.
+- New gate `repro_no_amount_status.py` (in build.yml). Fails on 2.6.3 code. All 15 gates pass.
+- `--guidemo` now ends on the no-amount status line (for the winbuild screenshot).
+- Auto-update stays off (owner: manual-only). version-ezloan-desktop.json untouched (2.5.4).
+- 2.6.3 build outputs moved to `rel/2.6.3/` before the 2.6.4 build.
