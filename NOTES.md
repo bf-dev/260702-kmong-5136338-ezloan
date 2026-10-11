@@ -2611,3 +2611,10 @@ rendered at first full page (~14-21s after alloc), so ordering is fixed inside t
 - `--guidemo` now ends on the no-amount status line (for the winbuild screenshot).
 - Auto-update stays off (owner: manual-only). version-ezloan-desktop.json untouched (2.5.4).
 - 2.6.3 build outputs moved to `rel/2.6.3/` before the 2.6.4 build.
+- Built: winbuild 2026-10-11 06:10Z, PE32+ (GUI), 41,632,056 B, sha256 5668f68c1580f8e9...45f0.
+  Hosted https://static.neoworks.us/5136338/ezloan-desktop-banner.exe (version-free, new name,
+  HTTP 200, hash verified). Builder run posted `[app_started] 버전 2.6.4` (ezloan-ci-selftest).
+  Not delivered to the customer yet.
+- winbuild gotcha: with `rel/` (73MB of old exes, gitignored) in the tree the source tarball
+  upload failed silently (`scp -q`, then "tar.exe: Failed to open C:\builds-src.tar.gz"). Moving
+  `rel/` out of the project during the build fixed it.
